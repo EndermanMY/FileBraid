@@ -8,8 +8,9 @@ const { startTransfer } = require('./transfer.cjs');
 const { createJournal, latestJournal, identifyEndpoints } = require('./journal.cjs');
 const { listLibraryWorkflows, readLibraryWorkflow, saveLibraryWorkflow, removeLibraryWorkflow } = require('./workflow-library.cjs');
 
+app.setPath('userData', join(app.getPath('appData'), 'cardhelper'));
 const root = join(__dirname, '..');
-const engineName = process.platform === 'win32' ? 'cardhelper-engine.exe' : 'cardhelper-engine';
+const engineName = process.platform === 'win32' ? 'filebraid-engine.exe' : 'filebraid-engine';
 const releaseEngine = join(root, 'engine', 'target', 'release', engineName);
 const engine = existsSync(releaseEngine) ? releaseEngine : join(root, 'engine', 'target', 'debug', engineName);
 const previews = new WeakMap();
@@ -85,7 +86,7 @@ ipcMain.handle('workflow:open', async () => {
 
 ipcMain.handle('workflow:save', async (_, workflow) => {
   const { filePath } = await dialog.showSaveDialog({
-    defaultPath: 'cardhelper.workflow.json',
+    defaultPath: 'filebraid.workflow.json',
     filters: [{ name: '工作流', extensions: ['json'] }],
   });
   if (!filePath) return false;
@@ -183,13 +184,13 @@ ipcMain.handle('workflow:report', async ({ sender }, id, format) => {
   const report = items(reports, sender).get(id);
   if (!report || !['html', 'json'].includes(format)) throw new Error('没有可导出的报告。');
   const { filePath } = await dialog.showSaveDialog(BrowserWindow.fromWebContents(sender), {
-    defaultPath: `cardhelper-report.${format}`,
+    defaultPath: `filebraid-report.${format}`,
     filters: [{ name: format.toUpperCase(), extensions: [format] }],
   });
   if (!filePath) return false;
   const labels = { verified: '校验通过', reused: '校验后复用', copied: '复制完成，未校验', failed: '失败', cancelled: '已中止' };
   const body = format === 'json' ? JSON.stringify(report, null, 2) :
-    '<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>CardHelper 复制报告</title>'
+    '<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>FileBraid 复制报告</title>'
     + (report.operation === 'verify' ? '<h1>所选素材复验报告</h1>' : '<h1>所选素材复制报告</h1>') + '<p>' + escapeHtml(report.date) + '</p>'
     + '<table border="1"><thead><tr><th>来源</th><th>目标</th><th>状态</th><th>校验值</th><th>备注</th></tr></thead><tbody>'
     + report.outcomes.map(row => '<tr>' + [row.source, row.destination, labels[row.status],

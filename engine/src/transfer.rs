@@ -220,7 +220,7 @@ impl Drop for Temporary {
 fn temporary(parent: &Path) -> io::Result<(Temporary, File)> {
     loop {
         let serial = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let path = parent.join(format!(".cardhelper-{}-{serial}.partial", std::process::id()));
+        let path = parent.join(format!(".filebraid-{}-{serial}.partial", std::process::id()));
         match OpenOptions::new().write(true).create_new(true).open(&path) {
             Ok(file) => return Ok((Temporary(path), file)),
             Err(cause) if cause.kind() == io::ErrorKind::AlreadyExists => {}

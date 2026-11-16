@@ -23,7 +23,7 @@ const nodeGroups: { title: string; kinds: Kind[] }[] = [
   { title: '复制策略', kinds: ['standardcopy', 'fastcopy'] },
   { title: '校验', kinds: Object.keys(algorithms) as Kind[] },
 ];
-const nodeDragType = 'application/x-cardhelper-node';
+const nodeDragType = 'application/x-filebraid-node';
 const officialWorkflowName = '双目标工作流';
 const isAlgorithm = (kind?: Kind) => kind !== undefined && Object.hasOwn(algorithms, kind);
 const port = (kind?: Kind) => kind === 'standardcopy' || kind === 'fastcopy' ? 'transfer' : isAlgorithm(kind) ? 'verify' : 'files';
@@ -112,7 +112,7 @@ const outcomeLabels = {
 };
 declare global {
   interface Window {
-    cardhelper: {
+    filebraid: {
       directory(): Promise<string | null>;
       directoryItems(folder: string, relative: string): Promise<FolderEntry[]>;
       open(): Promise<unknown>;
@@ -272,7 +272,7 @@ function FolderBranch({ folder, relative, rows }: { folder: string; relative: st
   const [problem, setProblem] = useState('');
   useEffect(() => {
     let current = true;
-    window.cardhelper.directoryItems(folder, relative).then(
+    window.filebraid.directoryItems(folder, relative).then(
       items => { if (current) setEntries(items); },
       error => { if (current) setProblem(String(error.message ?? error).replace(/^Error invoking remote method '[^']+': Error: /, '')); },
     );
@@ -679,7 +679,7 @@ function WorkflowLibrary({ busy, load, save, remove, openWorkflow, saveWorkflow 
 
   useEffect(() => {
     let active = true;
-    window.cardhelper.listLibraryWorkflows().then(
+    window.filebraid.listLibraryWorkflows().then(
       result => { if (active) setItems(result); },
       () => { if (active) { setItems([]); setProblem('读取本机工作流失败。'); } },
     );
@@ -792,7 +792,7 @@ function App() {
   useEffect(() => {
     if (menu) menuRef.current?.querySelector<HTMLElement>('input, button:not(:disabled)')?.focus();
   }, [menu]);
-  useEffect(() => window.cardhelper.onProgress((id, event) => {
+  useEffect(() => window.filebraid.onProgress((id, event) => {
     const time = performance.now();
     setTasks(previous => previous.map(item => {
       if (item.plan.id !== id) return item;
@@ -977,7 +977,7 @@ function App() {
         setSelectedTask(id);
         updateTask(id, { status: 'running', message: undefined });
         try {
-          const summary = await window.cardhelper.execute(id, verifyOnly);
+          const summary = await window.filebraid.execute(id, verifyOnly);
           if (!summary) {
             updateTask(id, { status: 'waiting' });
             break;
@@ -1049,7 +1049,7 @@ function App() {
     <main>
       <header>
         <div className="app-titlebar">
-          <div className="brand"><span aria-hidden="true">▰</span> CardHelper</div>
+          <div className="brand"><span aria-hidden="true">▰</span> 织序 FileBraid</div>
         </div>
         <div className="app-toolbar">
           <nav className="actions view-tabs" aria-label="工作区">
@@ -1058,7 +1058,7 @@ function App() {
           </nav>
           {view === 'workflow' && <div className="actions workflow-actions">
             <button disabled={busy} onClick={() => void perform(async () => {
-              const job = await window.cardhelper.recover();
+              const job = await window.filebraid.recover();
               if (!job) { setMessage('没有上次任务记录。'); return; }
               replace(decode(job.workflow));
               const status = { finished: '已完成', incomplete: '未全部完成', interrupted: '已中断' }[job.status];
@@ -1071,7 +1071,7 @@ function App() {
               if (missing.length) {
                 throw new Error(`有 ${missing.length} 个「文件输出」未连接复制策略。请连接「标准复制」或「快速流复制」。`);
               }
-              const plan = await window.cardhelper.preview(workflow);
+              const plan = await window.filebraid.preview(workflow);
               setTasks(items => [...items, { plan, workflow, name: workflowName, status: 'waiting', outcomes: new Map(), progress: new Map(), samples: new Map() }]);
               setSelectedTask(plan.id);
               setView('queue');
@@ -1083,7 +1083,7 @@ function App() {
         removeFolderConnections: (id, folders) => setEdges(items => items.filter(edge =>
           edge.target !== id || !edge.targetHandle?.startsWith('folder:') || !folders.has(edge.targetHandle.slice(7)))),
         pinMenu: (event, pin) => openMenu(event, { type: 'pin', pin }), chooseDirectory: id => void perform(async () => {
-        const path = await window.cardhelper.directory();
+        const path = await window.filebraid.directory();
         if (path) update(id, path);
       }) }}>
       <div className="workspace">
@@ -1096,29 +1096,29 @@ function App() {
             {library === 'nodes' ? <NodeLibrary add={addNode} /> :
               <WorkflowLibrary busy={busy}
                 openWorkflow={() => void perform(async () => {
-                  const value = await window.cardhelper.open();
+                  const value = await window.filebraid.open();
                   if (value !== null) {
                     const opened = decode(value);
-                    await window.cardhelper.clearRecovery();
+                    await window.filebraid.clearRecovery();
                     replace(opened);
                   }
                 })}
                 saveWorkflow={() => void perform(async () => {
-                  if (await window.cardhelper.save(workflow)) setMessage('工作流已保存。');
+                  if (await window.filebraid.save(workflow)) setMessage('工作流已保存。');
                 })}
                 load={(name, id) => void perform(async () => {
-                  const next = id ? decode(await window.cardhelper.openLibraryWorkflow(id)) : officialWorkflow;
-                  await window.cardhelper.clearRecovery();
+                  const next = id ? decode(await window.filebraid.openLibraryWorkflow(id)) : officialWorkflow;
+                  await window.filebraid.clearRecovery();
                   replace(next, name);
                 })}
                 save={(name, added) => void perform(async () => {
-                  const item = await window.cardhelper.saveLibraryWorkflow(name, workflow);
+                  const item = await window.filebraid.saveLibraryWorkflow(name, workflow);
                   added(item);
                   setWorkflowName(item.name);
                   setMessage('已存入本机工作流库。');
                 })}
                 remove={(id, removed) => void perform(async () => {
-                  await window.cardhelper.removeLibraryWorkflow(id);
+                  await window.filebraid.removeLibraryWorkflow(id);
                   removed();
                 })} />}
           </div>
@@ -1249,7 +1249,7 @@ function App() {
               onClick={() => void runTasks(waiting)}>运行队列</button>
             {queueRunning && <button onClick={() => {
               stopQueue.current = true;
-              void window.cardhelper.cancel();
+              void window.filebraid.cancel();
             }}>停止队列</button>}
           </div>
           {tasks.map((item, index) => <button className="queue-item" key={item.plan.id} aria-pressed={item.plan.id === selectedTask}
@@ -1267,7 +1267,7 @@ function App() {
             <button disabled={queueRunning || task.status !== 'waiting'} onClick={() => void runTasks([task])}>开始复制</button>
             <button disabled={queueRunning || task.status !== 'waiting'} onClick={() => void runTasks([task], true)}>仅复验</button>
             <button disabled={queueRunning} onClick={() => void perform(async () => {
-              await window.cardhelper.removeTask(result.id);
+              await window.filebraid.removeTask(result.id);
               setTasks(items => items.filter(item => item.plan.id !== result.id));
               setSelectedTask(tasks.find(item => item.plan.id !== result.id)?.plan.id);
             })}>从队列移除</button>
@@ -1298,7 +1298,7 @@ function App() {
           </div>}
           {task.report && !running && <div className="actions">
             {(['html', 'json'] as const).map(format => <button key={format} disabled={busy}
-              onClick={() => void window.cardhelper.report(result.id, format).catch(cause => {
+              onClick={() => void window.filebraid.report(result.id, format).catch(cause => {
                 setFailed(true);
                 setMessage(`报告导出失败：${cause instanceof Error ? cause.message : cause}`);
               })}>导出 {format.toUpperCase()}</button>)}

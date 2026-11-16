@@ -1,16 +1,18 @@
 # 织序 FileBraid
 
-织序 FileBraid（原名 CardHelper）是节点式文件复制、备份与整理桌面应用。通过节点搭建、预览和执行文件处理工作流，影视拷卡是其中的专业场景。产品设计和验收范围见 [设计文档](docs/README.md)。
+织序 FileBraid是节点式文件复制、备份与整理桌面应用。通过节点搭建、预览和执行文件处理工作流，影视拷卡是其中的专业场景。产品设计和验收范围见 [设计文档](docs/README.md)。
 
-品牌名称已确定；当前程序、启动入口和内部工程标识仍使用 CardHelper，工程更名尚未完成。
+项目名称统一为织序 FileBraid；旧版工作流和任务记录继续使用原数据目录。
 
 本仓库目前尚未选择开源许可证；第三方依赖各自的许可证仍然适用。
 
-项目包含 Electron 桌面界面、React Flow 工作流画布和 Rust 复制引擎。当前处于 Windows Demo 阶段，macOS 构建和真实设备故障场景仍需验证。历史 WPF 源码保存在原 CardHelper 仓库。
+项目包含 Electron 桌面界面、React Flow 工作流画布和 Rust 复制引擎。当前处于 Windows Demo 阶段，macOS 构建和真实设备故障场景仍需验证。历史 WPF 源码保存在原项目仓库。
 
 ## 在 Windows 上启动
 
-在文件资源管理器中双击 [Start-CardHelper.cmd](Start-CardHelper.cmd)，即可打开工作区里已构建的版本。首次构建或更新源码后，请按以下步骤构建。
+Windows x64 测试包解压后，双击目录内的 `FileBraid.exe`。整个目录需要保持完整；这是早期测试版，建议使用测试数据体验。
+
+在文件资源管理器中双击 [Start-FileBraid.cmd](Start-FileBraid.cmd)，即可打开工作区里已构建的版本。首次构建或更新源码后，请按以下步骤构建。
 
 Windows 标题栏右侧可最小化、最大化／还原或关闭窗口。拖动标题栏空白处可移动窗口，工作区切换和任务操作位于下一行。
 

@@ -1,6 +1,6 @@
 const { contextBridge, ipcRenderer } = require('electron');
 
-contextBridge.exposeInMainWorld('cardhelper', {
+contextBridge.exposeInMainWorld('filebraid', {
   directory: () => ipcRenderer.invoke('workflow:directory'),
   directoryItems: (folder, relative) => ipcRenderer.invoke('workflow:directory-items', folder, relative),
   open: () => ipcRenderer.invoke('workflow:open'),

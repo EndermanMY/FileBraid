@@ -1,5 +1,5 @@
 [package]
-name = "cardhelper-engine"
+name = "filebraid-engine"
 version = "0.1.0"
 edition = "2021"
 
