@@ -32,7 +32,7 @@ dependencies = [
 
 [[package]]
 name = "filebraid-engine"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "blake3",
  "crc32fast",

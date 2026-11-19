@@ -40,7 +40,7 @@ async function listLibraryWorkflows(directory) {
 async function saveLibraryWorkflow(directory, name, workflow) {
   const label = typeof name === 'string' ? name.trim() : '';
   if (!label || label.length > 80) throw new Error('请输入 1 至 80 个字符的工作流名称。');
-  if (!workflow || workflow.version !== 3 || !Array.isArray(workflow.nodes) || !Array.isArray(workflow.edges)) {
+  if (!workflow || (workflow.version !== 3 && workflow.version !== 4) || !Array.isArray(workflow.nodes) || !Array.isArray(workflow.edges)) {
     throw new Error('工作流格式无效。');
   }
   if (Buffer.byteLength(JSON.stringify(workflow)) > limit) throw new Error('工作流超过 1 MB。');

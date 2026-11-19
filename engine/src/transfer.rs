@@ -8,7 +8,7 @@ use std::{
     io::{self, Read, Write},
     path::{Path, PathBuf},
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
-    sync::mpsc,
+    sync::{mpsc, Condvar, Mutex},
     time::{Duration, Instant},
 };
 
@@ -21,6 +21,8 @@ pub struct Outcome {
     source: PathBuf,
     status: &'static str,
     checksums: Checksums,
+    source_checksums: Checksums,
+    target_checksums: Checksums,
     retried: bool,
     error: Option<String>,
 }
@@ -28,7 +30,7 @@ pub struct Outcome {
 fn source_matches(row: &Row) -> Result<(), String> {
     let metadata = fs::symlink_metadata(&row.source).map_err(|cause| error(&row.source, cause))?;
     if !metadata.is_file() || is_link(&metadata) || metadata.len() != row.bytes
-        || metadata.modified().ok() != Some(row.modified)
+        || metadata.modified().ok() != Some(row.modified.0)
     {
         return Err(format!("来源已变化：{}", row.source.display()));
     }
@@ -43,6 +45,8 @@ pub struct Progress<'a> {
     phase: &'static str,
     bytes: u64,
     bytes_per_second: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_checksums: Option<&'a Checksums>,
 }
 
 type Hashers = Vec<(Algorithm, Hasher)>;
@@ -51,8 +55,54 @@ fn update_hashes(hashes: &mut Hashers, bytes: &[u8]) {
     for (_, hash) in hashes { hash.update(bytes); }
 }
 
-fn check_stop(stopped: &AtomicBool) -> Result<(), String> {
-    if stopped.load(Ordering::Relaxed) { Err("任务已中止。".into()) } else { Ok(()) }
+#[derive(Default)]
+struct ControlState {
+    cancelled: bool,
+    paused_at: Option<Instant>,
+    pause_time: Duration,
+}
+
+#[derive(Default)]
+pub struct TransferControl {
+    state: Mutex<ControlState>,
+    changed: Condvar,
+}
+
+impl TransferControl {
+    pub fn pause(&self) {
+        let mut state = self.state.lock().unwrap();
+        if !state.cancelled && state.paused_at.is_none() {
+            state.paused_at = Some(Instant::now());
+        }
+    }
+
+    pub fn resume(&self) {
+        let mut state = self.state.lock().unwrap();
+        if let Some(start) = state.paused_at.take() {
+            state.pause_time += start.elapsed();
+        }
+        self.changed.notify_all();
+    }
+
+    pub fn cancel(&self) {
+        self.state.lock().unwrap().cancelled = true;
+        self.changed.notify_all();
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.state.lock().unwrap().cancelled
+    }
+
+    fn paused_for(&self) -> Duration {
+        let state = self.state.lock().unwrap();
+        state.pause_time + state.paused_at.map_or(Duration::ZERO, |start| start.elapsed())
+    }
+}
+
+fn check_stop(stopped: &TransferControl) -> Result<(), String> {
+    let state = stopped.changed.wait_while(stopped.state.lock().unwrap(), |state|
+        state.paused_at.is_some() && !state.cancelled).unwrap();
+    if state.cancelled { Err("任务已中止。".into()) } else { Ok(()) }
 }
 
 fn prepare_buffer(buffer: &mut Vec<u8>, size: usize) -> Result<(), String> {
@@ -65,7 +115,7 @@ fn prepare_buffer(buffer: &mut Vec<u8>, size: usize) -> Result<(), String> {
 }
 
 fn pump(path: &Path, mut output: Option<&mut File>, algorithms: &[Algorithm],
-    stopped: &AtomicBool, options: Option<(CopySettings, Mode)>, scratch: &mut Vec<u8>,
+    stopped: &TransferControl, options: Option<(CopySettings, Mode)>, scratch: &mut Vec<u8>,
     mut advance: impl FnMut(usize) -> Result<(), String>,
 ) -> Result<Checksums, String> {
     let mut input = File::open(path).map_err(|cause| error(path, cause))?;
@@ -113,7 +163,7 @@ fn pump(path: &Path, mut output: Option<&mut File>, algorithms: &[Algorithm],
 }
 
 fn pipeline(input: &mut File, writer: &mut File, path: &Path, settings: CopySettings,
-    hashes: &mut Hashers, stopped: &AtomicBool, mut advance: impl FnMut(usize) -> Result<(), String>,
+    hashes: &mut Hashers, stopped: &TransferControl, mut advance: impl FnMut(usize) -> Result<(), String>,
 ) -> Result<(), String> {
     let slots = settings.slots();
     let block = settings.block_mib * MIB;
@@ -156,37 +206,46 @@ fn pipeline(input: &mut File, writer: &mut File, path: &Path, settings: CopySett
 }
 
 fn transfer_stream(row: &Row, path: &Path, output: Option<&mut File>, algorithms: &[Algorithm],
-    stopped: &AtomicBool, scratch: &mut Vec<u8>, phase: &'static str, report: &impl Fn(&Progress),
+    stopped: &TransferControl, scratch: &mut Vec<u8>, phase: &'static str, report: &impl Fn(&Progress),
 ) -> Result<Checksums, String> {
     let mut bytes = 0;
     let mut tick = Instant::now();
     let mut previous = 0;
     let emit = |bytes, bytes_per_second| report(&Progress {
         kind: "progress", destination: &row.destination, target: &row.target, phase, bytes, bytes_per_second,
+        source_checksums: None,
     });
     emit(0, 0.0);
     let timed_from = Instant::now();
+    let paused_before = stopped.paused_for();
+    let mut paused_at_tick = paused_before;
     let options = row.copy_settings.zip(row.copy_mode);
     let limit = if phase == "copy" { options.map_or(0, |(settings, _)| settings.limit_mib_s) } else { 0 };
     let checksums = pump(path, output, algorithms, stopped, options, scratch, |chunk| {
         bytes += chunk as u64;
         if limit != 0 {
             let ideal = Duration::from_secs_f64(bytes as f64 / (f64::from(limit) * MIB as f64));
-            while let Some(wait) = ideal.checked_sub(timed_from.elapsed()) {
-                if wait.is_zero() { break; }
+            loop {
                 check_stop(stopped)?;
+                let paused = stopped.paused_for().saturating_sub(paused_before);
+                let active = timed_from.elapsed().saturating_sub(paused);
+                let Some(wait) = ideal.checked_sub(active) else { break; };
+                if wait.is_zero() { break; }
                 std::thread::sleep(wait.min(Duration::from_millis(25)));
             }
         }
-        let elapsed = tick.elapsed();
+        let paused = stopped.paused_for();
+        let elapsed = tick.elapsed().saturating_sub(paused.saturating_sub(paused_at_tick));
         if elapsed >= Duration::from_millis(225) {
             emit(bytes, (bytes - previous) as f64 / elapsed.as_secs_f64());
             tick = Instant::now();
+            paused_at_tick = paused;
             previous = bytes;
         }
         Ok(())
     })?;
-    emit(bytes, if bytes > previous { (bytes - previous) as f64 / tick.elapsed().as_secs_f64().max(0.001) } else { 0.0 });
+    let elapsed = tick.elapsed().saturating_sub(stopped.paused_for().saturating_sub(paused_at_tick));
+    emit(bytes, if bytes > previous { (bytes - previous) as f64 / elapsed.as_secs_f64().max(0.001) } else { 0.0 });
     Ok(checksums)
 }
 
@@ -244,7 +303,13 @@ enum Prepared {
 }
 type FileResult = Result<(&'static str, Checksums, bool), String>;
 
-fn prepare(row: &Row, stopped: &AtomicBool, verify_only: bool, scratch: &mut Vec<u8>, report: &impl Fn(&Progress)) -> Result<Prepared, String> {
+#[derive(Default)]
+struct Comparison {
+    source: Checksums,
+    target: Checksums,
+}
+
+fn prepare(row: &Row, stopped: &TransferControl, verify_only: bool, scratch: &mut Vec<u8>, report: &impl Fn(&Progress)) -> Result<Prepared, String> {
     check_stop(stopped)?;
     let _priority = IoPriorityGuard::enter(row.copy_settings.is_some_and(|settings| settings.low_io));
     source_matches(row)?;
@@ -256,16 +321,17 @@ fn prepare(row: &Row, stopped: &AtomicBool, verify_only: bool, scratch: &mut Vec
     if target_path(&row.root, relative)?.1 { return Ok(Prepared::Existing); }
     let (temporary, mut output) = temporary(parent).map_err(|cause| error(parent, cause))?;
     let expected = transfer_stream(row, &row.source, Some(&mut output), &row.verified_by, stopped, scratch, "copy", report)?;
+    check_stop(stopped)?;
     report(&Progress { kind: "progress", destination: &row.destination, target: &row.target,
-        phase: "flush", bytes: row.bytes, bytes_per_second: 0.0 });
+        phase: "flush", bytes: row.bytes, bytes_per_second: 0.0, source_checksums: Some(&expected) });
     output.sync_all().map_err(|cause| cause.to_string())?;
     drop(output);
     source_matches(row)?;
     Ok(Prepared::Staged { temporary, expected })
 }
 
-fn finish(row: &Row, mut prepared: Prepared, stopped: &AtomicBool, verify_only: bool,
-    scratch: &mut Vec<u8>, report: &impl Fn(&Progress),
+fn finish(row: &Row, mut prepared: Prepared, stopped: &TransferControl, verify_only: bool,
+    scratch: &mut Vec<u8>, report: &impl Fn(&Progress), comparison: &mut Comparison,
 ) -> FileResult {
     let _priority = IoPriorityGuard::enter(row.copy_settings.is_some_and(|settings| settings.low_io));
     for attempt in 0..2 {
@@ -279,20 +345,26 @@ fn finish(row: &Row, mut prepared: Prepared, stopped: &AtomicBool, verify_only: 
                 if (algorithms.is_empty() || !verify_only) && !algorithms.contains(&Algorithm::Sha256) {
                     algorithms.push(Algorithm::Sha256);
                 }
-                let expected = transfer_stream(row, &row.source, None, &algorithms, stopped, scratch, "source", report)?;
+                comparison.source = transfer_stream(row, &row.source, None, &algorithms, stopped, scratch, "source", report)?;
                 source_matches(row)?;
-                if transfer_stream(row, &row.destination, None, &algorithms, stopped, scratch, "verify", report)? != expected {
+                comparison.target = transfer_stream(row, &row.destination, None, &algorithms, stopped, scratch, "verify", report)?;
+                if comparison.target != comparison.source {
                     return Err(if verify_only { "目标文件校验值与来源不同。" } else { "已有目标文件内容不同，请调整目标路径。原文件已保留。" }.into());
                 }
                 source_matches(row)?;
-                return Ok((if verify_only { "verified" } else { "reused" }, expected, attempt != 0));
+                return Ok((if verify_only { "verified" } else { "reused" }, comparison.source.clone(), attempt != 0));
             }
             Prepared::Staged { temporary, expected } => {
-                if !row.verified_by.is_empty() && transfer_stream(row, &temporary.0, None, &row.verified_by, stopped, scratch, "verify", report)? != expected {
-                    if attempt == 1 { return Err("目标校验值不匹配，完整重拷后仍失败。".into()); }
-                    drop(temporary);
-                    prepared = prepare(row, stopped, false, scratch, report)?;
-                    continue;
+                comparison.source.clone_from(&expected);
+                if !row.verified_by.is_empty() {
+                    comparison.target = transfer_stream(row, &temporary.0, None, &row.verified_by, stopped, scratch, "verify", report)?;
+                    if comparison.target != comparison.source {
+                        if attempt == 1 { return Err("目标校验值不匹配，完整重拷后仍失败。".into()); }
+                        drop(temporary);
+                        prepared = prepare(row, stopped, false, scratch, report)?;
+                        comparison.target.clear();
+                        continue;
+                    }
                 }
                 source_matches(row)?;
                 check_stop(stopped)?;
@@ -306,7 +378,7 @@ fn finish(row: &Row, mut prepared: Prepared, stopped: &AtomicBool, verify_only: 
     unreachable!()
 }
 
-pub fn execute(plan: Plan, stopped: &AtomicBool, verify_only: bool, report: impl Fn(&Outcome) + Sync,
+pub fn execute(plan: Plan, stopped: &TransferControl, verify_only: bool, report: impl Fn(&Outcome) + Sync,
     progress: impl Fn(&Progress) + Sync) -> Vec<Outcome> {
     let mut targets = BTreeMap::<String, Vec<Row>>::new();
     let source_changed = AtomicBool::new(false);
@@ -324,7 +396,7 @@ pub fn execute(plan: Plan, stopped: &AtomicBool, verify_only: bool, report: impl
                 if source_changed.load(Ordering::Relaxed) { return Err("来源已变化，任务已暂停。".into()); }
                 Ok(())
             };
-            let outcome = |row: Row, result: FileResult| {
+            let outcome = |row: Row, result: FileResult, comparison: Comparison| {
                 if source_matches(&row).is_err() {
                     source_changed.store(true, Ordering::Relaxed);
                 }
@@ -332,9 +404,10 @@ pub fn execute(plan: Plan, stopped: &AtomicBool, verify_only: bool, report: impl
                     Ok(_) if source_changed.load(Ordering::Relaxed) && source_matches(&row).is_err() =>
                         ("failed", Checksums::new(), false, Some("来源已变化，请重新预览。".into())),
                     Ok((status, checksums, retried)) => (status, checksums, retried, None),
-                    Err(message) => (if stopped.load(Ordering::Relaxed) { "cancelled" } else { "failed" }, Checksums::new(), false, Some(message)),
+                    Err(message) => (if stopped.is_cancelled() { "cancelled" } else { "failed" }, Checksums::new(), false, Some(message)),
                 };
-                let outcome = Outcome { destination: row.destination, target: row.target, source: row.source, status, checksums, retried, error };
+                let outcome = Outcome { destination: row.destination, target: row.target, source: row.source, status, checksums,
+                    source_checksums: comparison.source, target_checksums: comparison.target, retried, error };
                 report(&outcome);
                 outcome
             };
@@ -344,18 +417,26 @@ pub fn execute(plan: Plan, stopped: &AtomicBool, verify_only: bool, report: impl
                 let prepared = available().and_then(|()| prepare(&row, stopped, verify_only, &mut scratch, progress));
                 match prepared {
                     Ok(prepared) if !verify_only && row.verify_timing == Some(VerifyTiming::AfterCopy) => {
+                        if let Prepared::Staged { expected, .. } = &prepared {
+                            progress(&Progress {
+                                kind: "progress", destination: &row.destination, target: &row.target,
+                                phase: "await_verify", bytes: row.bytes, bytes_per_second: 0.0, source_checksums: Some(expected),
+                            });
+                        }
                         pending.push((row, prepared));
                     }
                     Ok(prepared) => {
-                        let result = available().and_then(|()| finish(&row, prepared, stopped, verify_only, &mut scratch, progress));
-                        outcomes.push(outcome(row, result));
+                        let mut comparison = Comparison::default();
+                        let result = available().and_then(|()| finish(&row, prepared, stopped, verify_only, &mut scratch, progress, &mut comparison));
+                        outcomes.push(outcome(row, result, comparison));
                     }
-                    Err(message) => outcomes.push(outcome(row, Err(message))),
+                    Err(message) => outcomes.push(outcome(row, Err(message), Comparison::default())),
                 }
             }
             for (row, prepared) in pending {
-                let result = available().and_then(|()| finish(&row, prepared, stopped, false, &mut scratch, progress));
-                outcomes.push(outcome(row, result));
+                let mut comparison = Comparison::default();
+                let result = available().and_then(|()| finish(&row, prepared, stopped, false, &mut scratch, progress, &mut comparison));
+                outcomes.push(outcome(row, result, comparison));
             }
             outcomes
         })).collect();

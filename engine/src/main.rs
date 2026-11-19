@@ -9,7 +9,9 @@ use std::{
 mod transfer;
 mod checksum;
 mod copy_settings;
+mod copy_operation;
 mod file_lists;
+mod sony;
 use checksum::Algorithm;
 use copy_settings::{CopySettings, Mode};
 
@@ -41,6 +43,7 @@ enum Kind {
     Filter,
     Directory,
     Target,
+    Copy,
     Sha256,
     Crc32,
     Blake3,
@@ -74,6 +77,27 @@ struct Edge {
     target_handle: Option<String>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ModificationTime(std::time::SystemTime);
+
+impl Serialize for ModificationTime {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self.0.duration_since(std::time::UNIX_EPOCH) {
+            Ok(_) => self.0.serialize(serializer),
+            Err(before_epoch) => {
+                #[derive(Serialize)]
+                struct BeforeEpoch {
+                    secs_before_epoch: u64,
+                    nanos_before_epoch: u32,
+                }
+                let duration = before_epoch.duration();
+                BeforeEpoch { secs_before_epoch: duration.as_secs(), nanos_before_epoch: duration.subsec_nanos() }
+                    .serialize(serializer)
+            }
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct Row {
     source: PathBuf,
@@ -87,7 +111,7 @@ struct Row {
     existing: bool,
     root: PathBuf,
     target: String,
-    modified: std::time::SystemTime,
+    modified: ModificationTime,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq, Serialize)]
@@ -140,7 +164,7 @@ fn is_link(metadata: &fs::Metadata) -> bool {
     }
 }
 
-fn scan(dir: &Path, files: &mut Vec<(PathBuf, u64, std::time::SystemTime)>) -> Result<(), String> {
+fn scan(dir: &Path, files: &mut Vec<(PathBuf, u64, ModificationTime)>) -> Result<(), String> {
     let mut pending = vec![dir.to_path_buf()];
     while let Some(path) = pending.pop() {
         for entry in fs::read_dir(&path).map_err(|cause| error(&path, cause))? {
@@ -154,7 +178,7 @@ fn scan(dir: &Path, files: &mut Vec<(PathBuf, u64, std::time::SystemTime)>) -> R
                 pending.push(path);
             } else {
                 let modified = metadata.modified().map_err(|cause| error(&path, cause))?;
-                files.push((path, metadata.len(), modified));
+                files.push((path, metadata.len(), ModificationTime(modified)));
                 if files.len() > 20_000 {
                     return Err("当前预览最多支持 20,000 个源文件。".into());
                 }
@@ -202,26 +226,6 @@ fn expand_component(template: &str, parameters: &HashMap<String, String>) -> Res
     Ok(result)
 }
 
-fn category(path: &Path) -> &'static str {
-    let parts: Vec<_> = path.iter().map(|part| part.to_string_lossy().to_ascii_uppercase()).collect();
-    let extension = path.extension().unwrap_or_default().to_string_lossy().to_ascii_uppercase();
-    if parts.first().is_some_and(|part| part == "DCIM")
-        && matches!(extension.as_str(), "ARW" | "JPG" | "JPEG" | "HIF" | "HEIF")
-    {
-        "照片"
-    } else if matches!(extension.as_str(), "MP4" | "MXF")
-        && (parts.starts_with(&["M4ROOT".into(), "CLIP".into()]) || parts.starts_with(&["PRIVATE".into(), "M4ROOT".into(), "CLIP".into()]))
-    {
-        "视频"
-    } else if extension == "MP4"
-        && (parts.starts_with(&["M4ROOT".into(), "SUB".into()]) || parts.starts_with(&["PRIVATE".into(), "M4ROOT".into(), "SUB".into()]))
-    {
-        "代理"
-    } else {
-        "未识别"
-    }
-}
-
 fn target_path(root: &Path, relative: &Path) -> Result<(PathBuf, bool), String> {
     let mut path = root.to_path_buf();
     let mut parts = relative.iter().peekable();
@@ -261,15 +265,21 @@ fn check_disk_folder(root: &Path, relative: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn plan(workflow: Workflow) -> Result<Plan, String> {
-    let limits = match workflow.version { 1 => (100, 200), 2 | 3 => (101, 300), _ => (0, 0) };
+fn plan(mut workflow: Workflow) -> Result<Plan, String> {
+    let limits = match workflow.version { 1 => (100, 200), 2 | 3 => (101, 300), 4 => (202, 401), _ => (0, 0) };
     if limits.0 == 0 || workflow.nodes.len() > limits.0 || workflow.edges.len() > limits.1 {
         return Err("工作流版本或大小不受支持。".into());
     }
-    let nodes: HashMap<_, _> = workflow.nodes.iter().map(|node| (node.id.as_str(), node)).collect();
-    if nodes.len() != workflow.nodes.len() || nodes.contains_key("") {
+    let ids: HashSet<_> = workflow.nodes.iter().map(|node| node.id.as_str()).collect();
+    if ids.len() != workflow.nodes.len() || ids.contains("") {
         return Err("工作流含无效或重复的节点编号。".into());
     }
+    if workflow.version == 4 {
+        copy_operation::bind_targets(&mut workflow)?;
+    } else if workflow.nodes.iter().any(|node| node.kind == Kind::Copy) {
+        return Err("「复制」需要第 4 版工作流。".into());
+    }
+    let nodes: HashMap<_, _> = workflow.nodes.iter().map(|node| (node.id.as_str(), node)).collect();
     let mut inputs: HashMap<&str, Vec<&Edge>> = HashMap::new();
     let mut checks: HashMap<&str, BTreeSet<Algorithm>> = HashMap::new();
     let mut verification_timing = HashMap::new();
@@ -281,11 +291,11 @@ fn plan(workflow: Workflow) -> Result<Plan, String> {
             if target.kind != Kind::Target || (workflow.version >= 2 &&
                 (edge.source_handle.as_deref().unwrap_or("out") != "out" ||
                     edge.target_handle.as_deref().unwrap_or("transfer") != "transfer")) {
-                return Err("复制策略只能连接「文件输出」的复制策略端口。".into());
+                return Err("复制策略必须连接到相应的复制策略端口。".into());
             }
             let settings = if source.kind == Kind::Fastcopy { Some(CopySettings::parse(&source.value)?) } else { None };
             if strategies.insert(target.id.as_str(), settings).is_some() {
-                return Err("每个「文件输出」只能连接一种复制策略。".into());
+                return Err("每项复制只能使用一种复制策略。".into());
             }
             continue;
         }
@@ -309,7 +319,7 @@ fn plan(workflow: Workflow) -> Result<Plan, String> {
             return Err("工作流含无效的文件连线。".into());
         }
         if target.kind == Kind::Tree && (source.kind != Kind::Source || edge.source_handle.as_deref().unwrap_or("out") != "out") {
-            return Err("目录树输入的来源目录端口只能连接「文件输入」。".into());
+            return Err("「来源目录树」的「文件」端口只能连接「源目录」。".into());
         }
         let port = edge.target_handle.as_deref().unwrap_or("files");
         if port != "files" && !(target.kind == Kind::Subtract && port == "exclude")
@@ -330,7 +340,11 @@ fn plan(workflow: Workflow) -> Result<Plan, String> {
         let mut outgoing = workflow.edges.iter().filter(|edge| edge.source == node.id);
         let target = outgoing.next().map(|edge| nodes[edge.target.as_str()]);
         let Some(target) = target.filter(|target| target.kind == Kind::Target && outgoing.next().is_none()) else {
-            return Err("使用实际输出文件夹时，请将目录树输出直接连接一个「文件输出」。".into());
+            return Err(if workflow.version == 4 {
+                "使用实际输出文件夹时，请将「目标目录树」通过「复制」连接一个「目标目录」。"
+            } else {
+                "使用实际输出文件夹时，请将「目标目录树」直接连接一个「文件输出」。"
+            }.into());
         };
         let target_root = root(&target.value)?;
         for relative in selected {
@@ -359,7 +373,8 @@ fn plan(workflow: Workflow) -> Result<Plan, String> {
         let copy_settings = match strategies.get(target.id.as_str()) {
             Some(settings) => *settings,
             None if workflow.version == 1 => None,
-            None => return Err("请为每个「文件输出」连接一种复制策略：标准复制或快速流复制。".into()),
+            None if workflow.version == 4 => return Err("请为每个「复制」连接一种复制策略：标准复制策略或流复制策略。".into()),
+            None => return Err("请为每个「文件输出」连接一种复制策略：标准复制策略或流复制策略。".into()),
         };
         let files = lists.target_files(&target.id)?;
         let destination = root(&target.value)?;
@@ -389,7 +404,7 @@ fn plan(workflow: Workflow) -> Result<Plan, String> {
                 source: item.path.clone(),
                 destination: path,
                 bytes: item.bytes,
-                category: if item.camera { category(&item.relative) } else { "文件" },
+                category: item.camera.map_or("文件", sony::Category::label),
                 verified_by,
                 verify_timing,
                 copy_settings,
@@ -418,6 +433,8 @@ fn plan(workflow: Workflow) -> Result<Plan, String> {
         }
     }
     let inventory: std::collections::BTreeMap<_, _> = lists.scans.into_iter().collect();
+    let routed: HashSet<_> = rows.iter().map(|row| &row.source).collect();
+    lists.excluded.extend(lists.sony_split_sources.into_iter().filter(|path| !routed.contains(path)));
     let excluded: Vec<_> = lists.excluded.into_iter().collect();
     let source_contents = serde_json::to_vec(&inventory).map_err(|cause| cause.to_string())?;
     let source_fingerprint = format!("{:x}", Sha256::digest(source_contents));
@@ -440,17 +457,36 @@ fn run() -> Result<(), String> {
     if input.len() > 1_000_000 {
         return Err("工作流超过 1 MB。".into());
     }
-    let output = if execution {
+    let output = if mode.as_deref() == Some("sony-structure") {
+        #[derive(Deserialize)]
+        struct Source {
+            folder: String,
+            output: String,
+        }
+        let source: Source = serde_json::from_slice(&input).map_err(|cause| cause.to_string())?;
+        serde_json::to_value(file_lists::probe_sony(&source.folder, &source.output)?)
+    } else if execution {
         let request: Execution = serde_json::from_slice(&input).map_err(|cause| cause.to_string())?;
         let plan = plan(request.workflow)?;
         if plan.fingerprint != request.fingerprint {
             return Err("来源或目标已变化，请重新预览。".into());
         }
-        let stopped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopped = std::sync::Arc::new(transfer::TransferControl::default());
         let monitor = stopped.clone();
         std::thread::spawn(move || {
-            let _ = io::stdin().read_line(&mut String::new());
-            monitor.store(true, std::sync::atomic::Ordering::Relaxed);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match io::stdin().read_line(&mut line) {
+                    Ok(count) if count > 0 => match line.trim() {
+                        "pause" => monitor.pause(),
+                        "resume" => monitor.resume(),
+                        _ => break,
+                    },
+                    _ => break,
+                }
+            }
+            monitor.cancel();
         });
         let excluded = plan.excluded.clone();
         let emit = |event: &dyn Fn(&mut io::StderrLock<'_>)| {

@@ -1,6 +1,6 @@
 {
   "name": "filebraid",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "private": true,
   "main": "desktop/main.cjs",
   "scripts": {
@@ -8,6 +8,7 @@
     "typecheck": "tsc --noEmit",
     "build": "npm run typecheck && vite build --base=./",
     "test": "node --test desktop/*.test.cjs",
+    "test:desktop": "node desktop/run-queue-smoke.cjs",
     "start": "npm run build:engine && npm run build && electron ."
   },
   "dependencies": {

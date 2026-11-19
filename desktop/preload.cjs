@@ -2,6 +2,8 @@ const { contextBridge, ipcRenderer } = require('electron');
 
 contextBridge.exposeInMainWorld('filebraid', {
   directory: () => ipcRenderer.invoke('workflow:directory'),
+  shootingMedia: () => ipcRenderer.invoke('workflow:shooting-media'),
+  sonyStructure: source => ipcRenderer.invoke('workflow:sony-structure', source),
   directoryItems: (folder, relative) => ipcRenderer.invoke('workflow:directory-items', folder, relative),
   open: () => ipcRenderer.invoke('workflow:open'),
   save: workflow => ipcRenderer.invoke('workflow:save', workflow),
@@ -13,8 +15,8 @@ contextBridge.exposeInMainWorld('filebraid', {
   execute: (id, verifyOnly) => ipcRenderer.invoke('workflow:execute', id, verifyOnly),
   removeTask: id => ipcRenderer.invoke('workflow:remove-task', id),
   cancel: () => ipcRenderer.invoke('workflow:cancel'),
+  control: (id, action) => ipcRenderer.invoke('workflow:control', id, action),
   recover: () => ipcRenderer.invoke('workflow:recover'),
-  clearRecovery: () => ipcRenderer.invoke('workflow:clear-recovery'),
   report: (id, format) => ipcRenderer.invoke('workflow:report', id, format),
   onProgress: callback => {
     const listener = (_, id, outcome) => callback(id, outcome);

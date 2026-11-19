@@ -1,9 +1,10 @@
 # FileBraid 设计文档
 
-更新日期：2026-11-16。Windows Demo 开发中的新增设计收录于决策记录，交付与验证状态见里程碑。
+更新日期：2026-11-18。复盘和验收结果记录在路线图，已确认的行为写入决策记录。
 
 - [已确认设计与决策演变](DECISIONS.md)
 - [里程碑与验收](ROADMAP.md)
+- [软件著作权登记准备稿](SOFTWARE-COPYRIGHT.md)
 - [设计树与待决问题](DESIGN-TREE.md)
 - [领域术语](../GLOSSARY.md)
 - [ADR 0001：桌面与执行引擎](adr/0001-desktop-engine.md)
@@ -12,7 +13,7 @@
 - [ADR 0004：分流路径由连线保存](adr/0004-directory-routing.md)
 - [ADR 0005：工作流 v2 显式连接复制策略](adr/0005-explicit-copy-strategy.md)
 - [ADR 0006：工作流 v3 将目录名称保存在节点](adr/0006-directory-names-in-workflows.md)
-- [重大变更记录约定](../AGENTS.md)
+- [开发完成后的文档整理约定](../AGENTS.md)
 
 ## 现有代码与资料边界
 
@@ -34,3 +35,13 @@ GitHub 调研参考：
 Sony 官方目录示例参考：[FX3](https://helpguide.sony.net/ilc/2210/v1/en/contents/TP1000868300.html)、[A7 IV](https://helpguide.sony.net/ilc/2110/v1/en/print.html)、[ZV-E1](https://helpguide.sony.net/ilc/2310/v1/en/contents/0903B_import_pc.html)。SD 与 CFexpress 的 M4ROOT 位置可能不同；这些示例不是所有固件和录制模式的完整依赖规范。XML、代理配对、分段与特殊录制模式须进一步核验。
 
 最后几轮网络查询失败；Rust、Electron、节点库和哈希库的具体版本、维护状态、许可证、最低系统版本均未完成核验。参考项目的自述能力不等于本项目已验证能力。
+
+
+
+
+- [节点与端口命名标准](NODE-NAMING-STANDARD.md)
+- [11 月 17 日开发复盘](ROADMAP.md#2026-11-17-开发复盘)
+- [后续执行计划](ROADMAP.md#后续执行计划)
+- [11 月 18 日计划及验证结果](ROADMAP.md#2026-11-18-开发计划)
+  - [Sony FX3 样卡](ROADMAP.md#2026-11-18-sony-fx3-样卡验证)与 [USB 直连 Sony](ROADMAP.md#2026-11-18-usb-直连-sony-验证)
+  - [文件状态、哈希与分阶段进度](ROADMAP.md#2026-11-18-队列状态与分阶段进度验证)

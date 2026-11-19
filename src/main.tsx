@@ -1,50 +1,95 @@
-import { createContext, useCallback, useContext, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent, type MouseEvent } from 'react';
+import { createContext, useCallback, useContext, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent, type MouseEvent, type PointerEvent } from 'react';
 import { createRoot } from 'react-dom/client';
+import { createPortal } from 'react-dom';
+import { CanvasIcon, GraphMap, type MapOptions } from './canvas-tools';
+import { alignCanvas, type Alignment } from './canvas-layout';
 import {
-  addEdge, Background, Controls, Handle, Position, ReactFlow, reconnectEdge, SelectionMode, useEdgesState, useNodeConnections, useNodesState, useUpdateNodeInternals,
+  addEdge, Background, Handle, NodeResizeControl, Position, ReactFlow, ViewportPortal, reconnectEdge, SelectionMode, useEdgesState, useNodeConnections, useNodesState, useUpdateNodeInternals,
   type Connection, type Edge, type HandleType, type Node, type NodeProps, type ReactFlowInstance, type XYPosition,
 } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
 import './style.css';
-import { speedAxis, timeAxis } from './speed-axis';
+import { transferSpeedAxis } from './speed-axis';
+import { addSpeedSample, continuousSpeed, speedIntervals, stableSpeedEnd, type SpeedBucket } from './copy-speed';
+import { displayPath } from './path-display';
+import { fileWork } from './transfer-progress';
 
 const algorithms = {
-  crc32: 'CRC32', blake3: 'BLAKE3', md5: 'MD5', sha1: 'SHA-1', sha256: 'SHA-256', xxh3: 'xxHash3-64',
+  crc32: 'CRC32 校验', blake3: 'BLAKE3 校验', md5: 'MD5 校验', sha1: 'SHA-1 校验', sha256: 'SHA-256 校验', xxh3: 'xxHash3-64 校验',
 };
 const labels = {
-  source: '文件输入', target: '文件输出', tree: '目录树输入', outputtree: '目录树输出',
-  camera: 'Sony 卡结构', filter: '扩展名筛选', merge: '清单合并', subtract: '清单相减',
-  directory: '目录模板', standardcopy: '标准复制', fastcopy: '快速流复制', ...algorithms,
+  source: '源目录', media: '拍摄介质', target: '目标目录', tree: '来源目录树', outputtree: '目标目录树', copy: '复制',
+  camera: 'Sony 素材分类', filter: '按扩展名筛选', merge: '合并文件', subtract: '排除文件',
+  directory: '目录模板', standardcopy: '标准复制策略', fastcopy: '流复制策略', ...algorithms,
 };
 type Kind = keyof typeof labels;
 const nodeGroups: { title: string; kinds: Kind[] }[] = [
-  { title: '输入与输出', kinds: ['source', 'tree', 'outputtree', 'target'] },
-  { title: '整理与筛选', kinds: ['camera', 'directory', 'filter', 'merge', 'subtract'] },
+  { title: '输入与输出', kinds: ['source', 'media', 'tree', 'outputtree', 'target'] },
+  { title: '整理与筛选', kinds: ['camera', 'filter', 'merge', 'subtract'] },
+  { title: '文件操作', kinds: ['copy'] },
   { title: '复制策略', kinds: ['standardcopy', 'fastcopy'] },
   { title: '校验', kinds: Object.keys(algorithms) as Kind[] },
 ];
 const nodeDragType = 'application/x-filebraid-node';
 const officialWorkflowName = '双目标工作流';
+const sonyWorkflowName = 'Sony 双目标工作流';
+const isFileSource = (kind: Kind) => kind === 'source' || kind === 'media';
 const isAlgorithm = (kind?: Kind) => kind !== undefined && Object.hasOwn(algorithms, kind);
-const port = (kind?: Kind) => kind === 'standardcopy' || kind === 'fastcopy' ? 'transfer' : isAlgorithm(kind) ? 'verify' : 'files';
-type PortId = 'files' | 'verify' | 'transfer' | 'exclude';
+type PortId = 'files' | 'verify' | 'transfer' | 'exclude' | 'operation';
+const port = (kind?: Kind) => kind === 'copy' ? 'operation' :
+  kind === 'standardcopy' || kind === 'fastcopy' ? 'transfer' : isAlgorithm(kind) ? 'verify' : 'files';
 type Pin = { nodeId: string; direction: HandleType; handle: string };
-const portLabels = { files: '文件', verify: '校验策略', transfer: '复制策略', exclude: '排除清单' };
+const sonyOutputs = [
+  { id: 'out', label: '全部文件', detail: '保留输入的全部文件及相对路径，用于整卡归档' },
+  { id: 'sony:photos', label: '照片文件', detail: 'DCIM 中的 RAW、JPEG 和 HEIF 照片' },
+  { id: 'sony:videos', label: '视频文件', detail: '原片及按名称匹配的片段 XML 和缩略图' },
+  { id: 'sony:proxies', label: '代理文件', detail: 'SUB 中的代理视频和对应的片段 XML' },
+  { id: 'sony:management', label: '卡管理文件', detail: '卡索引、数据库和未配对的素材附属文件' },
+  { id: 'sony:luts', label: 'LUT 文件', detail: 'Sony 卡目录内的 .cube LUT' },
+  { id: 'sony:other', label: '其他文件', detail: '未识别文件，包括以 ._ 开头的 macOS 辅助文件' },
+];
+const portLabels = { files: '文件', verify: '校验策略', transfer: '复制策略', exclude: '排除文件', operation: '文件' };
 function acceptsPort(kind: Kind, input: PortId, from: Kind) {
-  if (kind === 'tree') return input === 'files' && from === 'source';
+  if (kind === 'target') return input === 'operation';
+  if (kind === 'copy') return input === 'files' || input === 'transfer' || input === 'verify';
+  if (kind === 'tree') return input === 'files' && isFileSource(from);
   if (input === 'exclude') return kind === 'subtract';
-  return kind === 'target' || (input === 'files' && ['camera', 'filter', 'directory', 'merge', 'subtract', 'outputtree'].includes(kind));
+  return input === 'files' && ['camera', 'filter', 'merge', 'subtract', 'outputtree'].includes(kind);
 }
 function filePort(handle: string): PortId | undefined {
   return handle.startsWith('folder:') || handle.startsWith('disk:') ? 'files' :
     Object.hasOwn(portLabels, handle) ? handle as PortId : undefined;
 }
+function portLabel(kind: Kind | undefined, direction: HandleType, handle: string) {
+  if (kind === 'camera' && direction === 'source') {
+    return sonyOutputs.find(output => output.id === handle)?.label ?? portLabels.files;
+  }
+  if (kind === 'copy') {
+    if (direction === 'source') return '输出文件';
+    if (handle === 'files') return '输入文件';
+  }
+  const type = direction === 'source' ? port(kind) : filePort(handle) ?? 'files';
+  return portLabels[type];
+}
 type OutputFolder = { id: string; name: string; parent?: string };
+const maxOutputFolders = 100;
+
+function directoryChain(path: string): OutputFolder[] {
+  const parts = path.split('/');
+  if (parts.length > maxOutputFolders) {
+    throw new Error('旧「目录模板」超过目录树支持的 100 层，请在旧版缩短层级后再打开。');
+  }
+  return parts.map((name, index) => ({
+    id: `level-${index + 1}`,
+    name,
+    parent: index > 0 ? `level-${index}` : undefined,
+  }));
+}
 function outputFolders(value: string): OutputFolder[] {
   if (!value) return [];
   try {
     const folders: unknown = JSON.parse(value);
-    if (!Array.isArray(folders) || folders.length > 100) return [];
+    if (!Array.isArray(folders) || folders.length > maxOutputFolders) return [];
     const known = new Set<string>();
     for (const folder of folders) {
       if (!folder || typeof folder.id !== 'string' || !folder.id || known.has(folder.id) ||
@@ -54,31 +99,70 @@ function outputFolders(value: string): OutputFolder[] {
     return folders;
   } catch { return []; }
 }
-type WorkflowNode = { id: string; kind: Kind; value: string; x: number; y: number };
-type Workflow = { version: 3; nodes: WorkflowNode[]; edges: Edge[] };
+type WorkflowNode = { id: string; kind: Kind; value: string; x: number; y: number; width?: number; height?: number; group?: string; groupName?: string };
+type Workflow = { version: 4; nodes: WorkflowNode[]; edges: Edge[] };
+const workflowLimits = { 1: [100, 200], 2: [101, 300], 3: [101, 300], 4: [202, 401] } as const;
 type LibraryWorkflow = { id: string; name: string; created: string };
 function copyStrategies(nodes: WorkflowNode[], edges: Edge[]) {
   const strategyNodes = new Set(nodes.filter(node => port(node.kind) === 'transfer').map(node => node.id));
   return new Set(edges.filter(edge => strategyNodes.has(edge.source) &&
     (edge.sourceHandle ?? 'out') === 'out' && (edge.targetHandle ?? 'transfer') === 'transfer').map(edge => edge.target));
 }
-type FlowNode = Node<{ kind: Kind; value: string }, 'blueprint'>;
+type FlowNode = Node<{ kind: Kind; value: string; group?: string; groupName?: string }, 'blueprint'>;
 type FolderEntry = { name: string; directory: boolean };
+type ShootingMedia = {
+  id: string; root: string; type: 'sd' | 'cfa' | 'shooting-storage';
+  deviceModel: string | null; deviceSerial: string | null; mediaModel: string | null; mediaSerial: string | null;
+};
+const mediaTypes = { sd: 'SD 卡', cfa: 'CFexpress Type A', 'shooting-storage': '拍摄存储' };
+const mediaSelection = ({ id, root }: ShootingMedia) => JSON.stringify({ id, root });
+type SonySource = { kind: 'media' | 'source'; value: string; output: string };
+
+function mediaRoot(value: string): string {
+  try {
+    const selection = JSON.parse(value);
+    return typeof selection?.root === 'string' ? selection.root : '';
+  } catch { return ''; }
+}
 function treeInputs(nodes: FlowNode[], edges: Edge[]) {
-  const sources = new Map(nodes.filter(node => node.data.kind === 'source').map(node => [node.id, node.data.value]));
+  const sources = new Map(nodes.filter(node => isFileSource(node.data.kind))
+    .map(node => [node.id, node.data.kind === 'media' ? mediaRoot(node.data.value) : node.data.value]));
   return new Map(edges.flatMap(edge => sources.has(edge.source) && (edge.targetHandle ?? 'files') === 'files'
     ? [[edge.target, sources.get(edge.source)!] as const] : []));
 }
+function sonyInputs(nodes: FlowNode[], edges: Edge[]) {
+  const byId = new Map(nodes.map(node => [node.id, node.data]));
+  const inputs = new Map(edges.filter(edge => (edge.targetHandle ?? 'files') === 'files').map(edge => [edge.target, edge]));
+  const sources = new Map<string, SonySource | null>();
+  for (const node of nodes) {
+    if (node.data.kind !== 'camera') continue;
+    const edge = inputs.get(node.id);
+    if (!edge) continue;
+    const upstream = byId.get(edge.source);
+    const output = edge.sourceHandle ?? 'out';
+    const root = upstream?.kind === 'tree' ? byId.get(inputs.get(edge.source)?.source ?? '') : upstream;
+    if (root?.kind === 'source' || root?.kind === 'media') {
+      sources.set(node.id, { kind: root.kind, value: root.value, output });
+    } else if (upstream?.kind === 'tree' && !root) {
+      sources.set(node.id, { kind: 'source', value: upstream.value, output });
+    } else {
+      sources.set(node.id, null);
+    }
+  }
+  return sources;
+}
 function treeDestinations(nodes: FlowNode[], edges: Edge[]) {
   const targets = new Map(nodes.filter(node => node.data.kind === 'target').map(node => [node.id, node.data.value]));
+  const copies = new Set(nodes.filter(node => node.data.kind === 'copy').map(node => node.id));
   const roots = new Map<string, string>();
   for (const node of nodes) {
     if (node.data.kind !== 'outputtree') continue;
     const outgoing = edges.filter(edge => edge.source === node.id);
-    if (outgoing.length === 1) {
-      const target = targets.get(outgoing[0].target);
-      if (target !== undefined) roots.set(node.id, target);
-    }
+    if (outgoing.length !== 1 || !copies.has(outgoing[0].target)) continue;
+    const operation = edges.filter(edge => edge.source === outgoing[0].target);
+    if (operation.length !== 1) continue;
+    const target = targets.get(operation[0].target);
+    if (target !== undefined) roots.set(node.id, target);
   }
   return roots;
 }
@@ -89,31 +173,214 @@ type VerifyTiming = 'per_file' | 'after_copy';
 const verifyTimingLabels = { per_file: '边复制边校验', after_copy: '复制完再校验' };
 type PlanRow = { source: string; destination: string; bytes: number; category: string; verified_by: string[]; verify_timing: VerifyTiming | null; existing: boolean; target: string; copy_settings: CopySettings | null; copy_mode: Exclude<CopyMode, 'auto'> | null };
 type Plan = { id: string; rows: PlanRow[]; excluded: string[]; fingerprint: string };
-type Outcome = { destination: string; target: string; status: 'verified' | 'reused' | 'copied' | 'failed' | 'cancelled'; error: string | null; retried: boolean; checksums: Record<string, string> };
-type CopyProgress = { kind: 'progress'; destination: string; target: string; phase: 'source' | 'copy' | 'flush' | 'verify'; bytes: number; bytes_per_second: number };
-const phases = { source: '读取来源', copy: '复制中', flush: '写入磁盘', verify: '校验目标' };
-type SpeedSample = { time: number; speed: number };
+type Checksums = Record<string, string>;
+type Outcome = { destination: string; target: string; status: 'verified' | 'reused' | 'copied' | 'failed' | 'cancelled';
+  error: string | null; retried: boolean; checksums: Checksums; source_checksums?: Checksums; target_checksums?: Checksums };
+type CopyProgress = { kind: 'progress'; destination: string; target: string; phase: 'source' | 'copy' | 'flush' | 'await_verify' | 'verify'; bytes: number; bytes_per_second: number; source_checksums?: Checksums };
+const phases = { source: '读取来源', copy: '复制中', flush: '写入磁盘', await_verify: '已写入，待校验', verify: '校验目标' };
+type TimedProgress = CopyProgress & { time: number };
+type CopySpeedByTarget = Map<string, Map<number, SpeedBucket>>;
+type Reading = { rate: number; time: number; destination: string; phase: CopyProgress['phase'] };
+type TargetReadings = Partial<Record<'write' | 'read', Reading>>;
 type QueueTask = {
   plan: Plan; workflow: Workflow; status: 'waiting' | 'running' | 'finished' | 'failed' | 'cancelled';
   name?: string;
-  outcomes: Map<string, Outcome>; progress: Map<string, CopyProgress>; samples: Map<string, SpeedSample[]>;
-  message?: string; report?: boolean;
+  outcomes: Map<string, Outcome>; progress: Map<string, TimedProgress>; samples: CopySpeedByTarget; readSamples: CopySpeedByTarget;
+  rates: Map<string, TargetReadings>;
+  awaitingVerification: ReadonlySet<string>;
+  sourceHashes: ReadonlyMap<string, Checksums>;
+  control?: 'paused' | 'cancelling';
+  message?: string; report?: boolean; verifyOnly?: boolean;
   speedStart?: number; speedElapsed?: number;
 };
+function waitingTask(plan: Plan, workflow: Workflow, name?: string): QueueTask {
+  return { plan, workflow, name, status: 'waiting', outcomes: new Map(), progress: new Map(),
+    samples: new Map(), readSamples: new Map(), rates: new Map(), awaitingVerification: new Set(), sourceHashes: new Map() };
+}
+
+function speedKind(phase: CopyProgress['phase']) {
+  if (phase === 'copy') return 'write';
+  if (phase === 'source' || phase === 'verify') return 'read';
+}
+
 const queueLabels = { waiting: '待执行', running: '运行中', finished: '已完成', failed: '未完成', cancelled: '已停止' };
-const chartColors = ['#79c9bc', '#f4ca7c', '#adbbeb', '#e7a99f'];
 function byteSize(bytes: number) {
   const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
   const unit = bytes >= 1 ? Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1) : 0;
   return `${(bytes / 1024 ** unit).toFixed(unit === 0 ? 0 : 1)} ${units[unit]}`;
 }
 const outcomeLabels = {
-  verified: '校验通过', reused: '校验后复用', copied: '复制完成，未校验', failed: '失败', cancelled: '已中止',
+  verified: '校验通过', reused: '已跳过', copied: '复制完成，未校验', failed: '失败', cancelled: '已中止',
 };
+const skippedDescription = '目标已有同内容的文件，本次跳过写入。';
+const statusIcons = {
+  verified: '', reused: '', copied: '', failed: '', cancelled: '', pending: '',
+  await_verify: '', copy: '', flush: '', source: '', verify: '',
+};
+
+function FileStatus({ state, status, percent, error }: {
+  state: keyof typeof statusIcons; status: string; percent?: number; error?: string | null;
+}) {
+  const detail = [status + (percent === undefined ? '' : ` · ${percent}%`),
+    error ?? (state === 'reused' ? skippedDescription : undefined)].filter(Boolean).join('\n');
+  return <td className="file-status" title={detail}>
+    {percent !== undefined ? <span role="progressbar" aria-label={status} aria-valuenow={percent} data-state={state}>
+      <svg viewBox="0 0 16 16" aria-hidden="true" className="file-progress-ring">
+        <circle className="file-progress-track" cx="8" cy="8" r="6" />
+        <circle cx="8" cy="8" r="6" pathLength="100" strokeDasharray={`${percent} 100`} transform="rotate(-90 8 8)" />
+      </svg>
+    </span> : <span role="img" aria-label={status} data-state={state} data-icon={statusIcons[state]}>
+      {(state === 'verified' || state === 'copied') && <svg viewBox="0 0 16 16" aria-hidden="true" className="file-check-icon">
+        {state === 'verified' ? <path d="M1.3 8.5l3.1 3.1L11 5m-5.7 3.5 3.1 3.1L15 5" /> : <path d="m2.7 8.4 3.5 3.5 7.1-7.1" />}
+      </svg>}
+      {state === 'failed' && <svg viewBox="0 0 16 16" aria-hidden="true" className="file-error-icon">
+        <path d="M7.3 2.6a.8.8 0 0 1 1.4 0l6.2 10.5a.8.8 0 0 1-.7 1.2H1.8a.8.8 0 0 1-.7-1.2Z" />
+        <path className="file-error-mark" d="M8 6v3.4m0 2.2h.01" />
+      </svg>}
+      {(state === 'cancelled' || state === 'await_verify') && <svg viewBox="0 0 16 16" aria-hidden="true" className="file-timing-icon">
+        <circle cx="8" cy="8" r="5.7" />
+        {state === 'cancelled' ? <path d="m4 12 8-8" /> : <path d="M8 4.9v3.3h3.1" />}
+      </svg>}
+      {state === 'pending' && <svg viewBox="0 0 16 16" aria-hidden="true" className="file-pending-icon">
+        <rect x="5.5" y="5.5" width="5" height="5" />
+      </svg>}
+      {state === 'reused' && <svg viewBox="0 0 16 16" aria-hidden="true" className="file-reused-icon">
+        <path d="M2.3 8.1a5.9 5.9 0 0 1 10.8-2.2m.3-3v4.4H9" />
+        <rect x="4.2" y="10" width="7.6" height="3.4" rx=".7" />
+      </svg>}
+    </span>}
+  </td>;
+}
+
+const fileStatusGuide = [
+  { state: 'pending', status: '待处理', description: '文件已加入队列，等待处理。' },
+  { state: 'copy', status: '复制中', percent: 55, description: '进度环显示当前文件写入的比例。' },
+  { state: 'verify', status: '校验中', percent: 55, description: '进度环显示当前文件在该读取阶段的比例。' },
+  { state: 'await_verify', status: phases.await_verify, description: '已写入临时文件，等待校验。' },
+  { state: 'copied', status: outcomeLabels.copied, description: '文件已写入目标，未配置校验。' },
+  { state: 'verified', status: outcomeLabels.verified, description: '来源与目标的校验值一致。' },
+  { state: 'reused', status: outcomeLabels.reused, description: skippedDescription },
+  { state: 'failed', status: outcomeLabels.failed, description: '处理失败，悬浮文件状态可查看原因。' },
+  { state: 'cancelled', status: outcomeLabels.cancelled, description: '任务取消后，此文件未完成。' },
+] as const;
+
+function FileStatusGuide() {
+  return <details className="file-status-guide">
+    <summary>状态说明</summary>
+    <div className="file-status-panel"><table aria-label="文件状态说明">
+      <thead><tr><th>图标</th><th>状态</th><th>说明</th></tr></thead>
+      <tbody>{fileStatusGuide.map(item => <tr key={item.state}>
+        <FileStatus state={item.state} status={item.status} percent={'percent' in item ? item.percent : undefined} />
+        <td>{item.status}</td><td>{item.description}</td>
+      </tr>)}</tbody>
+    </table></div>
+  </details>;
+}
+
+const fileColumns = ['来源', '目标路径', '大小', '复制策略', '校验策略', '来源哈希', '目标哈希', '状态'];
+const fileRowHeight = 44;
+const overscanRows = 12;
+
+function QueueFileList({ plan, activePath, renderRow }: {
+  plan: Plan; activePath?: string; renderRow(row: PlanRow, index: number): React.ReactNode;
+}) {
+  const viewport = useRef<HTMLDivElement>(null);
+  const [scrollTop, setScrollTop] = useState(0);
+  const [listHeight, setListHeight] = useState(260);
+  useLayoutEffect(() => {
+    const list = viewport.current;
+    if (!list) return;
+    const measure = () => setListHeight(list.clientHeight);
+    const observer = new ResizeObserver(measure);
+    observer.observe(list);
+    measure();
+    return () => observer.disconnect();
+  }, []);
+  const [follow, setFollow] = useState(true);
+  const [widths, setWidths] = useState<number[]>();
+  const drag = useRef<{ index: number; x: number; widths: number[] }>(null);
+  const active = useMemo(() => plan.rows.findIndex(row => row.destination === activePath), [plan.rows, activePath]);
+
+  useLayoutEffect(() => {
+    if (viewport.current) viewport.current.scrollTop = 0;
+    setScrollTop(0);
+  }, [plan.id]);
+
+  useLayoutEffect(() => {
+    const list = viewport.current;
+    if (!follow || active < 0 || !list) return;
+    const header = list.querySelector('thead')?.clientHeight ?? 0;
+    const visibleHeight = list.clientHeight - header;
+    const top = active * fileRowHeight;
+    if (top < list.scrollTop || top + fileRowHeight > list.scrollTop + visibleHeight) {
+      list.scrollTop = Math.max(0, top - Math.floor((visibleHeight - fileRowHeight) / 2));
+      setScrollTop(list.scrollTop);
+    }
+  }, [follow, active, plan.id, listHeight]);
+
+  const first = Math.max(0, Math.floor(scrollTop / fileRowHeight) - overscanRows);
+  const last = Math.min(plan.rows.length, Math.ceil((scrollTop + listHeight) / fileRowHeight) + overscanRows);
+  const columnWidths = () => Array.from(viewport.current?.querySelectorAll('th') ?? [], header => header.getBoundingClientRect().width);
+  const resize = (index: number, base: number[], delta: number) =>
+    setWidths(base.map((width, column) => column === index ? Math.max(44, width + delta) : width));
+  const spacer = (rows: number) => rows > 0 && <tr className="file-list-spacer" aria-hidden="true">
+    <td colSpan={fileColumns.length} style={{ height: rows * fileRowHeight }} />
+  </tr>;
+
+  return <>
+    <label className="file-list-follow"><input type="checkbox" checked={follow}
+      onChange={event => setFollow(event.target.checked)} />自动滚动到当前文件</label>
+    <div className="table" ref={viewport} onScroll={event => setScrollTop(event.currentTarget.scrollTop)}>
+      <table aria-rowcount={plan.rows.length + 1}
+        style={widths ? { width: widths.reduce((sum, width) => sum + width, 0), minWidth: 0 } : undefined}>
+        <colgroup>{fileColumns.map((title, index) =>
+          <col key={title} className={widths ? undefined : `file-col-${index}`} style={widths ? { width: widths[index] } : undefined} />
+        )}</colgroup>
+        <thead><tr>{fileColumns.map((title, index) => <th key={title} scope="col">
+          {title}
+          <span className="file-column-resize" role="separator" aria-orientation="vertical"
+            aria-label={`调整${title}列宽`} tabIndex={0}
+            onPointerDown={event => {
+              if (event.button !== 0) return;
+              event.currentTarget.setPointerCapture(event.pointerId);
+              drag.current = { index, x: event.clientX, widths: columnWidths() };
+            }}
+            onPointerMove={event => {
+              const start = drag.current;
+              if (start?.index === index) resize(index, start.widths, event.clientX - start.x);
+            }}
+            onLostPointerCapture={() => { drag.current = null; }}
+            onKeyDown={event => {
+              if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
+              event.preventDefault();
+              resize(index, columnWidths(), event.key === 'ArrowLeft' ? -12 : 12);
+            }} />
+        </th>)}</tr></thead>
+        <tbody>{spacer(first)}
+          {plan.rows.slice(first, last).map((row, index) => renderRow(row, first + index))}
+          {spacer(plan.rows.length - last)}
+        </tbody>
+      </table>
+    </div>
+  </>;
+}
+
+function HashCell({ sums, algorithm, label, comparison }: {
+  sums?: Checksums; algorithm?: string; label: string; comparison?: 'match' | 'mismatch';
+}) {
+  const hash = algorithm && sums?.[algorithm];
+  const short = hash && hash.length >= 8 ? `${hash.slice(0, 4)}:${hash.slice(-4)}`.toUpperCase() : hash;
+  return <td className="file-hash" data-comparison={comparison}
+    title={hash ? `${label}\n${Object.entries(sums ?? {}).map(([name, value]) => name + ': ' + value).join('\n')}` : label}>
+    {short || '—'}
+  </td>;
+}
 declare global {
   interface Window {
     filebraid: {
       directory(): Promise<string | null>;
+      shootingMedia(): Promise<ShootingMedia[]>;
+      sonyStructure(source: SonySource): Promise<boolean>;
       directoryItems(folder: string, relative: string): Promise<FolderEntry[]>;
       open(): Promise<unknown>;
       save(workflow: Workflow): Promise<boolean>;
@@ -122,42 +389,58 @@ declare global {
       saveLibraryWorkflow(name: string, workflow: Workflow): Promise<LibraryWorkflow>;
       removeLibraryWorkflow(id: string): Promise<void>;
       preview(workflow: Workflow): Promise<Plan>;
-      execute(id: string, verifyOnly?: boolean): Promise<{ outcomes: Outcome[] } | null>;
+      execute(id: string, verifyOnly?: boolean): Promise<{ outcomes: Outcome[] }>;
       removeTask(id: string): Promise<void>;
-      cancel(): Promise<void>;
+      cancel(): Promise<boolean>;
+      control(id: string, action: 'pause' | 'resume' | 'cancel'): Promise<boolean>;
       recover(): Promise<{ workflow: unknown; status: 'finished' | 'incomplete' | 'interrupted'; date: string; count: number } | null>;
-      clearRecovery(): Promise<void>;
       report(id: string, format: 'html' | 'json'): Promise<boolean>;
       onProgress(callback: (id: string, event: Outcome | CopyProgress) => void): () => void;
     };
   }
 }
 
+const officialFolders = directoryChain('项目/A机/卡001');
 const officialWorkflow: Workflow = {
-  version: 3,
+  version: 4,
   nodes: [
     { id: 'source', kind: 'source', value: '', x: 0, y: 30 },
-    { id: 'camera', kind: 'camera', value: '', x: 285, y: 30 },
-    { id: 'directory', kind: 'directory', value: '项目/A机/卡001', x: 570, y: 30 },
-    { id: 'a', kind: 'target', value: '', x: 905, y: 0 },
-    { id: 'b', kind: 'target', value: '', x: 905, y: 235 },
+    { id: 'directory', kind: 'outputtree', value: JSON.stringify(officialFolders), x: 570, y: 30 },
+    { id: 'copy-a', kind: 'copy', value: '', x: 905, y: 0 },
+    { id: 'copy-b', kind: 'copy', value: '', x: 905, y: 235 },
+    { id: 'a', kind: 'target', value: '', x: 1190, y: 0 },
+    { id: 'b', kind: 'target', value: '', x: 1190, y: 235 },
     { id: 'sha256', kind: 'sha256', value: '', x: 570, y: 365 },
     { id: 'standardcopy', kind: 'standardcopy', value: '', x: 285, y: 365 },
   ],
   edges: [
-    ['source', 'camera'], ['camera', 'directory'], ['directory', 'a'],
-    ['directory', 'b'], ['sha256', 'a'], ['sha256', 'b'], ['standardcopy', 'a'], ['standardcopy', 'b'],
-  ].map(([source, target]) => ({ id: source + ':' + target, source, target })),
+    ['source', 'directory', `folder:${officialFolders.at(-1)!.id}`],
+    ['directory', 'copy-a', 'files'], ['directory', 'copy-b', 'files'],
+    ['sha256', 'copy-a', 'verify'], ['sha256', 'copy-b', 'verify'],
+    ['standardcopy', 'copy-a', 'transfer'], ['standardcopy', 'copy-b', 'transfer'],
+    ['copy-a', 'a', 'operation'], ['copy-b', 'b', 'operation'],
+  ].map(([source, target, targetHandle]) => ({ id: source + ':' + target, source, target, targetHandle })),
+};
+
+const sonyWorkflow: Workflow = {
+  ...officialWorkflow,
+  nodes: [...officialWorkflow.nodes, { id: 'camera', kind: 'camera', value: '', x: 285, y: 30 }],
+  edges: officialWorkflow.edges.filter(edge => edge.source !== 'source').concat([
+    { id: 'source:camera', source: 'source', target: 'camera', targetHandle: 'files' },
+    { id: 'camera:directory', source: 'camera', target: 'directory', targetHandle: `folder:${officialFolders.at(-1)!.id}` },
+  ]),
 };
 
 function canvasNode(node: WorkflowNode): FlowNode {
   return {
     id: node.id,
     type: 'blueprint',
-    dragHandle: '.node-title',
+    dragHandle: '.node-title, .node-field, .path, .node-note',
+    width: node.width,
+    height: node.height,
     position: { x: node.x, y: node.y },
-    data: { kind: node.kind, value: node.value },
-    className: port(node.kind) !== 'files' ? 'kind-algorithm' : 'kind-' + node.kind,
+    data: { kind: node.kind, value: node.value, group: node.group, groupName: node.groupName },
+    className: isAlgorithm(node.kind) || port(node.kind) === 'transfer' ? 'kind-algorithm' : 'kind-' + node.kind,
   };
 }
 
@@ -166,46 +449,88 @@ const NodeActions = createContext<{
   chooseDirectory(id: string): void;
   busy: boolean;
   treeFolders: ReadonlyMap<string, string>;
+  sonySources: ReadonlyMap<string, SonySource | null>;
   destinationFolders: ReadonlyMap<string, string>;
   removeFolderConnections(id: string, folders: ReadonlySet<string>): void;
   pinMenu(event: MouseEvent, pin: Pin): void;
   disconnect(pin: Pin): void;
 } | null>(null);
 
-function DirectoryTree({ value, update }: { value: string; update(value: string): void }) {
-  const parts = value.split('/');
+function useShootingMedia(enabled = true) {
+  const [devices, setDevices] = useState<ShootingMedia[]>();
+  const [problem, setProblem] = useState(false);
+  useEffect(() => {
+    if (!enabled) return;
+    let active = true;
+    let timer: number;
+    async function refresh() {
+      try {
+        const devices = await window.filebraid.shootingMedia();
+        if (active) { setDevices(devices); setProblem(false); }
+      } catch {
+        if (active) { setDevices([]); setProblem(true); }
+      }
+      if (active) timer = window.setTimeout(refresh, 3000);
+    }
+    void refresh();
+    return () => { active = false; window.clearTimeout(timer); };
+  }, [enabled]);
+  return { devices, problem };
+}
 
-  function move(index: number, offset: number) {
-    const next = [...parts];
-    [next[index], next[index + offset]] = [next[index + offset], next[index]];
-    update(next.join('/'));
-  }
+function MediaControl({ value, update }: { value: string; update(value: string): void }) {
+  const { devices, problem } = useShootingMedia();
+  const selected = devices?.find(device => mediaSelection(device) === value);
+  return <label className="verify-timing">来源设备
+    <select aria-label="来源拍摄介质" value={selected ? value : ''} onChange={event => update(event.target.value)}>
+      <option value="">{value ? '介质已离线或盘符变化' : devices ? '请选择设备' : '正在检测…'}</option>
+      {devices?.map(device => <option key={device.root} value={mediaSelection(device)}>
+        {device.root} · {mediaTypes[device.type]} {device.mediaModel ?? device.deviceModel ?? ''}
+      </option>)}
+    </select>
+    <span className={problem ? 'node-note error' : 'node-note'}>
+      {problem ? '读取拍摄介质失败，正在重试。' : selected
+        ? `介质序列号：${selected.mediaSerial ?? '未读取'}`
+        : devices?.length === 0 ? '暂无可用介质，插入后自动刷新。' : '插入介质后自动刷新。'}
+    </span>
+    {selected?.deviceSerial && selected.deviceSerial !== selected.mediaSerial &&
+      <span className="node-note" title="Windows 提供的设备序列号，可能属于相机或读卡器">
+        系统设备序列号：{selected.deviceSerial}
+      </span>}
+  </label>;
+}
 
-  function branch(index: number): React.ReactNode {
-    const part = parts[index];
-    return <li>
-      <div className="tree-row">
-        <span className="folder-icon" aria-hidden="true" />
-        <input aria-label={`第 ${index + 1} 层文件夹`} value={part} placeholder="文件夹名"
-          onChange={event => {
-            if (!event.target.value.includes('/')) {
-              update(parts.map((name, i) => i === index ? event.target.value : name).join('/'));
-            }
-          }} />
-        <button title="上移一层" aria-label={`上移第 ${index + 1} 层`} disabled={index === 0}
-          onClick={() => move(index, -1)}>↑</button>
-        <button title="移除这一层" aria-label={`移除第 ${index + 1} 层`}
-          onClick={() => update(parts.filter((_, i) => i !== index).join('/'))}>×</button>
-      </div>
-      {index + 1 < parts.length && <ul>{branch(index + 1)}</ul>}
-    </li>;
-  }
-
-  return <div className="folder-tree">
-    <div className="tree-root"><span className="folder-icon" aria-hidden="true" /> 目标根目录</div>
-    <ul aria-label="目录模板文件夹树">{branch(0)}</ul>
-    <button onClick={() => update(value ? value + '/新目录' : '新目录')}>＋ 添加子文件夹</button>
-  </div>;
+function SonyStatus({ source }: { source: SonySource | null | undefined }) {
+  const kind = source?.kind;
+  const value = source?.value;
+  const output = source?.output;
+  const { devices, problem } = useShootingMedia(kind === 'media' && Boolean(value));
+  const available = kind !== 'media' || devices?.some(device => mediaSelection(device) === value);
+  const [result, setResult] = useState<{ key: string; sony?: boolean; error?: string }>();
+  const key = JSON.stringify([kind, value, output]);
+  useEffect(() => {
+    if (!kind || !value || !output || !available) return;
+    let active = true;
+    window.filebraid.sonyStructure({ kind, value, output }).then(
+      sony => { if (active) setResult({ key, sony }); },
+      error => { if (active) setResult({ key, error: String(error.message ?? error) }); },
+    );
+    return () => { active = false; setResult(undefined); };
+  }, [available, key, kind, value, output]);
+  const match = available && result?.key === key ? result : undefined;
+  const label = source === undefined ? '请连接文件来源' : source === null ? '将在入队时检查上游处理结果'
+    : !value ? '请在上游选择介质或目录'
+      : problem && kind === 'media' ? '无法读取上游介质'
+        : available === false ? '上游介质已离线或盘符变化'
+          : match?.sony === true ? '已识别为 Sony 卡目录'
+            : match?.sony === false ? '未识别到 Sony 卡目录'
+              : match?.error ? '无法检查 Sony 卡目录' : '正在检查 Sony 卡目录…';
+  return <>
+    <span className={match?.sony === true ? 'node-note sony-recognized' :
+      match?.sony === false || match?.error ? 'node-note error' : 'node-note'}
+      role="status" title={match?.error}>{label}</span>
+    <span className="node-note">整卡备份接「全部文件」。</span>
+  </>;
 }
 
 function CopyControls({ value, update }: { value: string; update(value: string): void }) {
@@ -391,6 +716,7 @@ function TargetTree({ id, value, input }: { id: string; value: string; input(han
   const save = (entries: OutputFolder[]) => actions.update(id, JSON.stringify(entries));
 
   function add(parent?: string) {
+    if (folders.length >= maxOutputFolders) return;
     const siblings = new Set(folders.filter(folder => (folder.parent ?? undefined) === parent).map(folder => folder.name));
     let name = '新文件夹';
     for (let n = 2; siblings.has(name); n++) name = `新文件夹 ${n}`;
@@ -406,37 +732,67 @@ function TargetTree({ id, value, input }: { id: string; value: string; input(han
     save(folders.filter(folder => !removed.has(folder.id)));
   }
 
+  const byParent = new Map<string | undefined, OutputFolder[]>();
+  for (const folder of folders) {
+    const parent = folder.parent ?? undefined;
+    const siblings = byParent.get(parent);
+    if (siblings) siblings.push(folder);
+    else byParent.set(parent, [folder]);
+  }
+
+  function move(parent: string | undefined, index: number, offset: -1 | 1) {
+    const siblings = byParent.get(parent);
+    const next = index + offset;
+    if (!siblings || next < 0 || next >= siblings.length) return;
+    const reordered = [...siblings];
+    [reordered[index], reordered[next]] = [reordered[next], reordered[index]];
+
+    // Keep each parent before its children in the saved folder list.
+    const inOrder = (level?: string): OutputFolder[] => {
+      const children = level === parent ? reordered : byParent.get(level) ?? [];
+      return children.flatMap(folder => [folder, ...inOrder(folder.id)]);
+    };
+    save(inOrder());
+  }
+
   function branch(parent?: string, depth = 0): React.ReactNode {
-    return folders.filter(folder => (folder.parent ?? undefined) === parent).map(folder =>
-      <li key={folder.id}>
+    const siblings = byParent.get(parent) ?? [];
+    return siblings.map((folder, index) =>
+      <li key={folder.id} style={{ '--tree-indent': `${Math.min(depth, 6) * 12}px` } as CSSProperties}>
         <div className="target-tree-row node-port">
           {input(`folder:${folder.id}`, folder.name || '未命名文件夹')}
-          <div className="tree-row" style={{ marginInlineStart: Math.min(depth, 8) * 9 }}>
+          <div className="tree-row">
             <span className="folder-icon" aria-hidden="true" />
             <input aria-label="目标文件夹名称" value={folder.name} placeholder="文件夹名"
               onChange={event => save(folders.map(item => item.id === folder.id ? { ...item, name: event.target.value } : item))} />
-            <button type="button" disabled={folders.length >= 100} title="添加子文件夹" aria-label={`在 ${folder.name} 中添加子文件夹`}
-              onClick={() => add(folder.id)}>＋</button>
+            <button type="button" disabled={index === 0} title="同级上移"
+              aria-label={`上移 ${folder.name}`} onClick={() => move(parent, index, -1)}>↑</button>
+            <button type="button" disabled={index === siblings.length - 1} title="同级下移"
+              aria-label={`下移 ${folder.name}`} onClick={() => move(parent, index, 1)}>↓</button>
+            <button type="button" disabled={folders.length >= maxOutputFolders} title="添加同级文件夹"
+              aria-label={`在 ${folder.name} 同级添加文件夹`} onClick={() => add(parent)}>＋同级</button>
+            <button type="button" disabled={folders.length >= maxOutputFolders} title="添加子文件夹"
+              aria-label={`在 ${folder.name} 中添加子文件夹`} onClick={() => add(folder.id)}>＋子级</button>
             <button type="button" title="移除此文件夹及其子项的连线" aria-label={`移除 ${folder.name}`}
               onClick={() => remove(folder.id)}>×</button>
           </div>
         </div>
-        {folders.some(item => item.parent === folder.id) && <ul>{branch(folder.id, depth + 1)}</ul>}
+        {byParent.has(folder.id) && <ul>{branch(folder.id, depth + 1)}</ul>}
       </li>);
   }
 
   return <div className="target-tree">
-    {folders.length > 0 && <div className="node-field">规划目录</div>}
+    <div className="node-field">规划目录</div>
     {folders.length > 0 && <ul aria-label="目标目录树">{branch()}</ul>}
-    <button type="button" disabled={folders.length >= 100} onClick={() => add()}>添加规划文件夹</button>
+    <button type="button" disabled={folders.length >= maxOutputFolders} onClick={() => add()}>＋ 添加顶层文件夹</button>
   </div>;
 }
 
-function BlueprintNode({ id, data }: NodeProps<FlowNode>) {
+function BlueprintNode({ id, data, selected }: NodeProps<FlowNode>) {
   const actions = useContext(NodeActions)!;
   const { kind, value } = data;
   const strategy = port(kind);
-  const policy = strategy !== 'files';
+  const policy = strategy === 'transfer' || strategy === 'verify';
   const isPath = kind === 'source' || kind === 'tree' || kind === 'target';
   const linked = kind === 'tree' && actions.treeFolders.has(id);
   const folder = linked ? actions.treeFolders.get(id)! : value;
@@ -444,8 +800,30 @@ function BlueprintNode({ id, data }: NodeProps<FlowNode>) {
   const exclude = value.startsWith('exclude:');
   function pinProps(direction: HandleType, handle: string) {
     const pin = { nodeId: id, direction, handle };
+    const label = portLabel(kind, direction, handle);
+    const sonyOutput = kind === 'camera' && direction === 'source' ? sonyOutputs.find(output => output.id === handle) : undefined;
+    const detail = sonyOutput ? sonyOutput.detail : handle === 'operation'
+      ? `接收「${labels.copy}」的输出，指定这一步复制的落盘目录`
+      : direction === 'source' && kind === 'copy'
+        ? '计划写入的文件，需连接「目标目录」；启动任务后才实际写入'
+      : direction === 'target' && handle === 'files' && kind === 'tree'
+        ? `连接「${labels.source}」，使用其所选目录展开文件树`
+      : direction === 'target' && handle === 'files' && kind === 'outputtree'
+        ? '接收直接归入目标根目录的文件，支持多路连接'
+      : direction === 'target' && handle === 'files' && kind === 'merge'
+        ? '支持多路连接，合并接入的文件'
+      : handle === 'exclude' ? '按来源路径排除匹配文件，接收一路文件；不会删除原文件'
+      : direction === 'target' && handle === 'files' && kind === 'subtract'
+        ? '接收需要处理的文件；从中排除「排除文件」指定的条目'
+      : direction === 'target' && handle === 'transfer' ? '必接，选择一项复制策略'
+      : direction === 'target' && handle === 'verify' ? '可选，支持多个不同算法，校验时机须一致'
+      : direction === 'source' && kind === 'tree' ? '当前来源目录中的全部文件'
+      : direction === 'source' && kind === 'outputtree' ? '完成目标目录分配的文件'
+      : direction === 'source' && kind === 'source' ? '所选目录内的文件；连接目录树时提供该目录'
+      : direction === 'source' ? '拖到空白处添加兼容节点' : '右键查看连接';
     return {
-      title: direction === 'source' ? '输出端口 · 拖到空白处添加兼容节点' : '输入端口 · 右键查看连接',
+      'aria-label': label + (direction === 'source' ? ' · 输出端口' : ' · 输入端口'),
+      title: label + ' · ' + detail,
       onContextMenu: (event: MouseEvent) => {
         event.stopPropagation();
         actions.pinMenu(event, pin);
@@ -459,59 +837,78 @@ function BlueprintNode({ id, data }: NodeProps<FlowNode>) {
       },
     };
   }
-  const mainOutput = <div className={`node-port node-port-output ${strategy === 'transfer' ? 'transfer' : policy ? 'policy' : ''}`}>
-    {policy ? portLabels[strategy] : kind === 'tree' ? '全部文件输出' : kind === 'outputtree' ? '汇总文件输出' : '文件输出'}
+  const mainOutput = <div className={`node-port node-port-output ${strategy === 'operation' ? 'operation' :
+    strategy === 'transfer' ? 'transfer' : policy ? 'policy' : ''}`}>
+    {portLabel(kind, 'source', 'out')}
     <Handle id="out" type="source" position={Position.Right} {...pinProps('source', 'out')} />
   </div>;
   return <>
+    {selected && (isPath || kind === 'outputtree') && <NodeResizeControl position="bottom-right" minHeight={kind === 'tree' || kind === 'outputtree' ? 225 : 125} maxHeight={1600}
+      minWidth={kind === 'tree' || kind === 'outputtree' ? 285 : 210} maxWidth={1800} className="path-resize nodrag" />}
     <div className="node-title">{labels[kind]}</div>
     <div className="node-ports">
       {kind === 'outputtree' && mainOutput}
-      {kind !== 'source' && !policy && <div className="node-port">
-        <Handle id="files" type="target" position={Position.Left} {...pinProps('target', 'files')}
-          title={kind === 'tree' ? '连接「文件输入」以读取来源根目录'
-            : kind === 'outputtree' ? '接收直接复制到目标根目录的文件' : '输入端口 · 右键查看连接'} />
-        {kind === 'merge' ? '清单输入（可多连）' : kind === 'subtract' ? '主清单' : kind === 'tree' ? '来源根目录输入' : kind === 'outputtree' ? '全部文件输入' : '文件输入'}
+      {kind === 'target' && <div className="node-port operation">
+        <Handle id="operation" type="target" position={Position.Left} {...pinProps('target', 'operation')} /> {portLabel(kind, 'target', 'operation')}
+      </div>}
+      {!isFileSource(kind) && kind !== 'target' && kind !== 'outputtree' && !policy && <div className="node-port">
+        <Handle id="files" type="target" position={Position.Left} {...pinProps('target', 'files')} />
+        {portLabel(kind, 'target', 'files')}
       </div>}
       {kind === 'subtract' && <div className="node-port">
-        <Handle id="exclude" type="target" position={Position.Left} {...pinProps('target', 'exclude')} /> 排除清单
+        <Handle id="exclude" type="target" position={Position.Left} {...pinProps('target', 'exclude')} /> {portLabels.exclude}
       </div>}
-      {kind === 'target' && <div className="node-port policy">
-        <Handle id="verify" type="target" position={Position.Left} {...pinProps('target', 'verify')} /> 校验策略
+      {kind === 'copy' && <div className="node-port transfer">
+        <Handle id="transfer" type="target" position={Position.Left} {...pinProps('target', 'transfer')} /> {portLabels.transfer}
       </div>}
-      {kind === 'target' && <div className="node-port transfer">
-        <Handle id="transfer" type="target" position={Position.Left} {...pinProps('target', 'transfer')} /> 复制策略
+      {kind === 'copy' && <div className="node-port policy">
+        <Handle id="verify" type="target" position={Position.Left} {...pinProps('target', 'verify')} /> {portLabels.verify}
       </div>}
-      {kind !== 'target' && kind !== 'outputtree' && mainOutput}
+      {kind !== 'target' && kind !== 'outputtree' && kind !== 'tree' && kind !== 'camera' && mainOutput}
+      {kind === 'camera' && sonyOutputs.map(({ id, label }) =>
+        <div className="node-port node-port-output" key={id}>
+          {label}<Handle id={id} type="source" position={Position.Right} {...pinProps('source', id)} />
+        </div>)}
     </div>
-    <div className="node-body nodrag nowheel" onClick={event => {
+    {kind !== 'copy' && <div className="node-body nowheel" onClick={event => {
       if (event.target instanceof Element && event.target.closest('input, textarea, select, button, a, [contenteditable]')) {
         event.stopPropagation();
       }
     }}>
       {isPath && <>
         <div className="node-field">{kind === 'target' ? '目标目录' : linked ? '已连接的来源目录' : '来源目录'}</div>
-        <div className="path" title={folder}>{folder || (linked ? '请在上游「文件输入」选择目录' : '尚未选择目录')}</div>
+        <div className="path" title={folder}>{folder || (linked ? `请在上游「${labels.source}」选择目录` : '尚未选择目录')}</div>
         {!linked && <button disabled={actions.busy} onClick={() => actions.chooseDirectory(id)}>选择文件夹</button>}
       </>}
+      {kind === 'tree' && <div className="node-port node-port-output source-root-port">
+        <span className="node-field">输出全部文件</span>
+        {portLabel(kind, 'source', 'out')}
+        <Handle id="out" type="source" position={Position.Right} {...pinProps('source', 'out')}
+          aria-label="文件 · 整棵来源目录树的输出端口" />
+      </div>}
       {kind === 'tree' && folder && <DiskTree key={folder} id={id} folder={folder} direction="source" handle={relative => {
         const handle = `item:${relative}`;
         return <Handle id={handle} type="source" position={Position.Right} {...pinProps('source', handle)}
-          aria-label={`输出 ${relative}`} title={`拖动以输出 ${relative}`} />;
+          aria-label={`文件输出端口 · ${relative}`} title={`文件 · 选取 ${relative}；文件夹包含其内部文件`} />;
       }} />}
-      {kind === 'directory' && <DirectoryTree value={value} update={next => actions.update(id, next)} />}
       {kind === 'outputtree' && <>
         <div className="node-field">输出目录</div>
-        {destination ? <>
-          <div className="path" title={destination}>{destination}</div>
-          <DiskTree key={destination} id={id} folder={destination} direction="target" handle={relative =>
-            <Handle id={`disk:${relative}`} type="target" position={Position.Left} {...pinProps('target', `disk:${relative}`)}
-              aria-label={`输入到 ${relative}`} title={`输入到 ${relative}`} />
-          } />
-        </> : <span className="node-note">连接一个已选择目录的「文件输出」即可展开。</span>}
+        {destination
+          ? <div className="path" title={destination}>{destination}</div>
+          : <span className="node-note">通过「{labels.copy}」连接一个已选定的「{labels.target}」，即可展开。</span>}
+        <div className="node-port output-root-port">
+          <Handle id="files" type="target" position={Position.Left} {...pinProps('target', 'files')}
+            aria-label="文件 · 目标根目录输入端口" />
+          {portLabel(kind, 'target', 'files')}
+          <span className="node-field">写入目标根目录</span>
+        </div>
+        {destination && <DiskTree key={destination} id={id} folder={destination} direction="target" handle={relative =>
+          <Handle id={`disk:${relative}`} type="target" position={Position.Left} {...pinProps('target', `disk:${relative}`)}
+            aria-label={`文件输入端口 · ${relative}`} title={`文件 · 将接入的文件归入 ${relative}`} />
+        } />}
         <TargetTree id={id} value={value} input={(handle, name) =>
           <Handle id={handle} type="target" position={Position.Left} {...pinProps('target', handle)}
-            aria-label={`输入到 ${name}`} title={`输入到 ${name}`} />
+            aria-label={`文件输入端口 · ${name}`} title={`文件 · 将接入的文件归入 ${name}`} />
         } />
       </>}
       {kind === 'filter' && <div className="verify-timing">
@@ -524,12 +921,9 @@ function BlueprintNode({ id, data }: NodeProps<FlowNode>) {
         <span className="node-note">用逗号分隔。留空保留全部。</span>
       </div>}
       {kind === 'merge' && <span className="node-note">合并多条清单。相同源文件和相同落盘路径只保留一次。</span>}
-      {kind === 'subtract' && <span className="node-note">从主清单排除另一条线指定的源文件，按源路径匹配。</span>}
-      {kind === 'camera' && <>
-        <div className="node-field">目录识别</div>
-        <div>Sony SD / CFexpress</div>
-        <span className="node-note">识别照片、视频和代理，保留未知文件</span>
-      </>}
+      {kind === 'subtract' && <span className="node-note">从「文件」中排除「排除文件」指定的条目，按来源路径匹配；不会删除原文件。</span>}
+      {kind === 'media' && <MediaControl value={value} update={next => actions.update(id, next)} />}
+      {kind === 'camera' && <SonyStatus source={actions.sonySources.get(id)} />}
       {kind === 'fastcopy' && <CopyControls value={value} update={next => actions.update(id, next)} />}
       {kind === 'standardcopy' && <span className="node-field">通用文件流</span>}
       {isAlgorithm(kind) && <>
@@ -540,7 +934,7 @@ function BlueprintNode({ id, data }: NodeProps<FlowNode>) {
           </select>
         </label>
       </>}
-    </div>
+    </div>}
   </>;
 }
 
@@ -559,12 +953,14 @@ function resolveLegacyFolderName(template: string, parameters?: Record<string, u
 
 function decode(value: unknown): Workflow {
   const data = value as Partial<Omit<Workflow, 'version'> & { version: number; parameters: Record<string, unknown> }> | null;
-  if (!data || (data.version !== 1 && data.version !== 2 && data.version !== 3) || !Array.isArray(data.nodes) || !Array.isArray(data.edges)
-    || data.nodes.length > (data.version === 1 ? 100 : 101) || data.edges.length > (data.version === 1 ? 200 : 300)) {
+  const version = data?.version;
+  const limits = typeof version === 'number' && workflowLimits[version as keyof typeof workflowLimits];
+  if (!data || typeof version !== 'number' || !limits || !Array.isArray(data.nodes) || !Array.isArray(data.edges)
+    || data.nodes.length > limits[0] || data.edges.length > limits[1]) {
     throw new Error('不支持此工作流格式。');
   }
   if (!data.nodes.every(node => node && typeof node.id === 'string'
-    && Object.hasOwn(labels, node.kind) && typeof node.value === 'string'
+    && Object.hasOwn(labels, node.kind) && (version === 4 || node.kind !== 'copy') && typeof node.value === 'string'
     && Number.isFinite(node.x) && Number.isFinite(node.y))
     || new Set(data.nodes.map(node => node.id)).size !== data.nodes.length
     || !data.edges.every(edge => edge && typeof edge.id === 'string'
@@ -573,9 +969,15 @@ function decode(value: unknown): Workflow {
       && (edge.targetHandle == null || typeof edge.targetHandle === 'string'))) {
     throw new Error('工作流含无效节点或连线。');
   }
-  const nodes = data.nodes.map(({ id, kind, value, x, y }) => ({ id, kind, value, x, y }));
+  const nodes: WorkflowNode[] = data.nodes.map(({ id, kind, value, x, y, width, height, group, groupName }) => ({
+    id, kind, value, x, y,
+    width: typeof width === 'number' && width >= 210 && width <= 1800 ? width : undefined,
+    height: typeof height === 'number' && height >= 125 && height <= 1600 ? height : undefined,
+    group: typeof group === 'string' && group.length <= 80 && group ? group : undefined,
+    groupName: typeof groupName === 'string' && groupName.length <= 80 ? groupName.trim() || undefined : undefined,
+  }));
   const edges = data.edges.map(({ id, source, target, sourceHandle, targetHandle }) => ({ id, source, target, sourceHandle, targetHandle }));
-  if (data.version < 3) {
+  if (version < 3) {
     for (const node of nodes) {
       if (node.kind === 'directory') node.value = node.value.split('/')
         .map(part => resolveLegacyFolderName(part, data.parameters)).join('/');
@@ -587,7 +989,7 @@ function decode(value: unknown): Workflow {
       }
     }
   }
-  if (data.version === 1) {
+  if (version === 1) {
     const configured = copyStrategies(nodes, edges);
     const missing = nodes.filter(node => node.kind === 'target' && !configured.has(node.id));
     if (missing.length) {
@@ -599,43 +1001,110 @@ function decode(value: unknown): Workflow {
       }
     }
   }
-  return { version: 3, nodes, edges };
+  if (version < 4) {
+    for (const target of nodes.filter(node => node.kind === 'target')) {
+      const id = crypto.randomUUID();
+      nodes.push({ id, kind: 'copy', value: '', x: target.x, y: target.y });
+      target.x += 285;
+      for (const edge of edges) {
+        if (edge.target === target.id) edge.target = id;
+      }
+      edges.push({ id: crypto.randomUUID(), source: id, target: target.id, sourceHandle: 'out', targetHandle: 'operation' });
+    }
+  }
+  for (const node of nodes) {
+    if (node.kind !== 'directory') continue;
+    const folders = directoryChain(node.value);
+    const destination = `folder:${folders.at(-1)!.id}`;
+    node.kind = 'outputtree';
+    node.value = JSON.stringify(folders);
+    // Route the old main input to the deepest folder to preserve the original path prefix.
+    for (const edge of edges) {
+      if (edge.target === node.id && (edge.targetHandle ?? 'files') === 'files') {
+        edge.targetHandle = destination;
+      }
+    }
+  }
+  return { version: 4, nodes, edges };
 }
 
-function SpeedChart({ samples, targets, elapsed }: { samples: Map<string, SpeedSample[]>; targets: string[]; elapsed: number }) {
-  const { start, end, step: secondsStep } = timeAxis(elapsed);
-  const series = targets.map(target => (samples.get(target) ?? []).filter(point => point.time >= start));
-  const peak = Math.max(0, ...series.flatMap(values => values.map(point => point.speed)));
-  const { maximum, step: speedStep, unit } = speedAxis(peak);
-  const ticks = [0, 1, 2, 3, 4];
+function SpeedChart({ samples, readSamples, targets, duration, progress, live, activity, readOnly }: {
+  samples: CopySpeedByTarget; readSamples: CopySpeedByTarget; targets: string[]; duration: number;
+  progress: ReadonlyMap<string, TimedProgress>; live?: { write: number; read: number }; activity?: string; readOnly: boolean;
+}) {
+  const gradient = useId();
+  const [visible, setVisible] = useState({ write: true, read: true });
+  const end = Math.max(60, duration);
+  const start = end - 60;
+  const currentSamples = [...progress.values()].filter(event => {
+    const kind = speedKind(event.phase);
+    return kind && visible[kind] && duration - event.time <= 1.25;
+  });
+  const stableEnd = stableSpeedEnd(duration, !!live, currentSamples.map(event => event.time));
+  const series = [
+    { kind: 'write', history: samples, color: '#9add9f', label: '复制写入' },
+    { kind: 'read', history: readSamples, color: '#80c6ef', label: '校验读取' },
+  ] as const;
+  const shown = series.filter(stream => visible[stream.kind]).map(({ history, ...stream }) => ({
+    ...stream,
+    intervals: continuousSpeed(speedIntervals(targets.map(target => history.get(target)), start, stableEnd)),
+  }));
+  const points = shown.flatMap(stream => stream.intervals);
+  const peak = Math.max(0, ...points.map(point => point.speed));
+  const liveRate = live && Math.max(visible.write ? live.write : 0, visible.read ? live.read : 0);
+  const { maximum, step, unit } = transferSpeedAxis(points, stableEnd, liveRate);
+  const ticks = [4, 3, 2, 1, 0];
   const x = (time: number) => (time - start) / (end - start) * 720;
-  const y = (speed: number) => 124 - speed / maximum * 124;
-  return <figure className="speed-chart">
-    <figcaption><strong>复制速度</strong><span>{start > 0 ? '最近 60 秒' : '本次任务'}{peak > 0 ? ` · 峰值 ${byteSize(peak)}/s` : ''}</span></figcaption>
-    <div className="speed-axes">
-      <span className="speed-unit">{unit}</span>
-      <div className="speed-y" aria-hidden="true">{[...ticks].reverse().map(tick =>
-        <span key={tick} style={{ top: `${100 - tick * 25}%` }}>{(tick * speedStep).toLocaleString('zh-CN', { maximumFractionDigits: 3 })}</span>)}</div>
-      <svg viewBox="0 0 720 124" preserveAspectRatio="none" role="img" aria-label="各目标实时写入速度">
-        {ticks.map(tick => <line key={tick} x1="0" x2="720" y1={tick * 31} y2={tick * 31} className="chart-grid" />)}
-        {series.map((values, i) => {
-          const color = chartColors[i % chartColors.length];
-          return values.map((point, index) => {
-            const previous = values[index - 1];
-            return previous && point.time - previous.time <= 1
-              ? <line key={index} x1={x(previous.time)} y1={y(previous.speed)} x2={x(point.time)} y2={y(point.speed)}
-                stroke={color} strokeWidth="2" vectorEffect="non-scaling-stroke" />
-              : <circle key={index} cx={x(point.time)} cy={y(point.speed)} r="2" fill={color} />;
-          });
-        })}
-      </svg>
-      <div className="speed-x" aria-hidden="true">{ticks.map(tick =>
-        <span key={tick} style={{ left: `${tick * 25}%` }}>{Number((start + tick * secondsStep).toFixed(3))} 秒</span>)}</div>
+  const y = (speed: number) => 124 - Math.min(speed, maximum) / maximum * 124;
+  function trace(intervals: ReturnType<typeof speedIntervals>) {
+    const points = intervals.map(interval => ({ x: x((interval.start + interval.end) / 2), y: y(interval.speed) }));
+    const first = points[0];
+    let curve = `M ${x(intervals[0].start)} ${first.y} H ${first.x}`;
+    for (let index = 1; index < points.length; index++) {
+      const from = points[index - 1];
+      const to = points[index];
+      const middle = (from.x + to.x) / 2;
+      curve += ` C ${middle} ${from.y} ${middle} ${to.y} ${to.x} ${to.y}`;
+    }
+    return curve + ` H ${x(intervals[intervals.length - 1].end)}`;
+  }
+
+  return <figure className="speed-chart explorer-speed" data-chart={!visible.write && visible.read ? 'read' : undefined}>
+    <figcaption><strong>传输速度</strong><span>{live && <b>实时合计 · 写入 {live.write ? byteSize(live.write) + '/s' : readOnly ? '无新写入' : '等待写入'} · 校验读取 {live.read ? byteSize(live.read) + '/s' : '—'}</b>}
+      {!live && peak > 0 && <b>峰值 {byteSize(peak)}/s</b>}</span></figcaption>
+    {activity && <div className="speed-activity">{activity}</div>}
+    <div className="speed-plot">
+      <div className="speed-y" aria-label={`速度刻度，单位 ${unit}`}>
+        {ticks.map(tick => <span key={tick} style={{ top: `${(4 - tick) * 25}%` }}>
+          {(tick * step).toLocaleString('zh-CN', { maximumFractionDigits: 2 })}{tick === 4 ? ` ${unit}` : ''}
+        </span>)}
+      </div>
+    <svg viewBox="0 0 720 124" preserveAspectRatio="none" role="img" aria-label="复制写入和校验读取速度">
+      <defs>{series.map(stream => <linearGradient key={stream.kind} id={gradient + stream.kind} x1="0%" x2="0%" y1="0%" y2="100%">
+        <stop offset="0%" stopColor={stream.color} stopOpacity=".5" />
+        <stop offset="100%" stopColor={stream.color} stopOpacity=".12" />
+      </linearGradient>)}</defs>
+      {[0, 31, 62, 93, 124].map(tick => <line key={tick} x1="0" x2="720" y1={tick} y2={tick} className="chart-grid" />)}
+      {shown.filter(stream => stream.intervals.length > 0).map(stream => {
+        const curve = trace(stream.intervals);
+        const rate = live?.[stream.kind] ?? 0;
+        return <g key={stream.kind} data-speed={stream.kind}>
+          <path d={`${curve} V 124 H ${x(stream.intervals[0].start)} Z`} fill={`url(#${gradient + stream.kind})`} />
+          <path d={curve} fill="none" stroke={stream.color} strokeWidth="2" vectorEffect="non-scaling-stroke" />
+          {rate > 0 && <line x1="0" x2="720" y1={y(Math.min(rate, maximum))} y2={y(Math.min(rate, maximum))}
+            className="speed-reference" stroke={stream.color} vectorEffect="non-scaling-stroke" />}
+        </g>;
+      })}
+    </svg>
     </div>
-    {peak === 0 && <p className="speed-empty">暂无复制速度样本</p>}
-    <div className="chart-legend">{targets.map((target, i) => <span key={target}>
-      <i style={{ background: chartColors[i % chartColors.length] }} />目标 {i + 1}
-    </span>)}</div>
+    <div className="speed-window"><span>{start > 0 ? '最近 60 秒' : '本次任务'} · {duration.toFixed(0)} 秒
+      {peak > maximum && ` · 超出刻度的峰值 ${byteSize(peak)}/s`}</span>
+      <span className="chart-legend">{series.map(stream => <button key={stream.kind} type="button"
+        aria-pressed={visible[stream.kind]} title={visible[stream.kind] ? `隐藏${stream.label}` : `显示${stream.label}`}
+        onClick={() => setVisible(state => ({ ...state, [stream.kind]: !state[stream.kind] }))}>
+        <i style={{ background: stream.color }} />{stream.label}
+      </button>)}</span>
+    </div>
   </figure>;
 }
 
@@ -693,6 +1162,7 @@ function WorkflowLibrary({ busy, load, save, remove, openWorkflow, saveWorkflow 
     </div>
     <h2>官方工作流</h2>
     <button className="workflow-choice" disabled={busy} onClick={() => load(officialWorkflowName)}>{officialWorkflowName}</button>
+    <button className="workflow-choice" disabled={busy} onClick={() => load(sonyWorkflowName)}>{sonyWorkflowName}</button>
     <h2>我的工作流</h2>
     <form className="workflow-library-form" onSubmit={event => {
       event.preventDefault();
@@ -721,7 +1191,11 @@ function WorkflowLibrary({ busy, load, save, remove, openWorkflow, saveWorkflow 
   </div>;
 }
 
-type GraphMenu = { x: number; y: number; position: XYPosition } &
+function nodeSize(node: FlowNode) {
+  return { width: node.measured?.width ?? node.width ?? 240, height: node.measured?.height ?? 100 };
+}
+
+type GraphMenu = { x: number; y: number; position: XYPosition; groupId?: string } &
   ({ type: 'pane' | 'selection' } | { type: 'connection' | 'pin'; pin: Pin });
 
 function eventPoint(event: MouseEvent | globalThis.MouseEvent | TouchEvent) {
@@ -747,7 +1221,19 @@ function App() {
   const menuRef = useRef<HTMLDivElement>(null);
   const [menu, setMenu] = useState<GraphMenu>();
   const [menuLevel, setMenuLevel] = useState(-1);
+  const [organizeOpen, setOrganizeOpen] = useState(false);
+  const [groupDraft, setGroupDraft] = useState<string>();
   const [menuSearch, setMenuSearch] = useState('');
+  const [minimap, setMinimap] = useState(true);
+  const [mapHost, setMapHost] = useState<HTMLDivElement | null>(null);
+  const [mapOptions, setMapOptions] = useState<MapOptions>({ color: false, edges: true, groups: true });
+  const [toolMenu, setToolMenu] = useState<'mode' | 'zoom' | 'map'>();
+  const [canvasMode, setCanvasMode] = useState<'select' | 'hand'>('hand');
+  const [canvasZoom, setCanvasZoom] = useState(1);
+  const [showLinks, setShowLinks] = useState(true);
+
+  const [compact, setCompact] = useState(false);
+  const [frontNode, setFrontNode] = useState<string>();
   const reconnecting = useRef<string | null>(null);
   const [workflowName, setWorkflowName] = useState<string | undefined>(officialWorkflowName);
   const [busy, setBusy] = useState(false);
@@ -762,13 +1248,44 @@ function App() {
   const task = tasks.find(item => item.plan.id === selectedTask);
   const result = task?.plan;
   const running = task?.status === 'running';
+  const [queueClock, setQueueClock] = useState(0);
+  useEffect(() => {
+    if (!running || view !== 'queue') return;
+    const timer = window.setInterval(() => setQueueClock(performance.now()), 250);
+    return () => window.clearInterval(timer);
+  }, [running, view]);
+  const duration = Math.max(task?.speedElapsed ?? 0, running && task?.speedStart !== undefined
+    ? (queueClock - task.speedStart) / 1000 : 0);
+  function targetSpeed(id: string, kind: 'write' | 'read') {
+    const current = task?.progress.get(id);
+    const reading = task?.rates.get(id)?.[kind];
+    if (!running || task?.control || !current || speedKind(current.phase) !== kind || !reading ||
+      current.destination !== reading.destination || current.phase !== reading.phase || duration - reading.time > 1.25) return 0;
+    return reading.rate;
+  }
   const outcomes = task?.outcomes ?? new Map<string, Outcome>();
-  const progress = task?.progress ?? new Map<string, CopyProgress>();
+  const progress = task?.progress ?? new Map<string, TimedProgress>();
   const waiting = tasks.filter(item => item.status === 'waiting');
   const selectedNodes = nodes.filter(node => node.selected);
+  const groups = new Map<string, FlowNode[]>();
+  for (const node of nodes) {
+    if (!node.data.group) continue;
+    const members = groups.get(node.data.group) ?? [];
+    members.push(node);
+    groups.set(node.data.group, members);
+  }
+  const groupBoxes = [...groups].map(([group, members]) => {
+    const left = Math.min(...members.map(node => node.position.x)) - 18;
+    const top = Math.min(...members.map(node => node.position.y)) - 42;
+    const right = Math.max(...members.map(node => node.position.x + nodeSize(node).width)) + 18;
+    const bottom = Math.max(...members.map(node => node.position.y + nodeSize(node).height)) + 18;
+    return { group, name: members[0].data.groupName ?? group, members, box: { left, top, width: right - left, height: bottom - top } };
+  });
+  const movingGroup = useRef<{ pointer: number; x: number; y: number; zoom: number; positions: Map<string, XYPosition> }>(null);
   const selectedEdges = edges.filter(edge => edge.selected);
   const hasSelection = selectedNodes.length + selectedEdges.length > 0;
   const linkedFolders = useMemo(() => treeInputs(nodes, edges), [nodes, edges]);
+  const sonySources = useMemo(() => sonyInputs(nodes, edges), [nodes, edges]);
   const destinationFolders = useMemo(() => treeDestinations(nodes, edges), [nodes, edges]);
   const previousTreeRoots = useRef(new Map<string, string>());
   const previousDestinations = useRef(destinationFolders);
@@ -799,49 +1316,92 @@ function App() {
       const speedStart = item.speedStart ?? time;
       const speedElapsed = (time - speedStart) / 1000;
       const progress = new Map(item.progress);
-      const samples = new Map(item.samples);
-      const speed = 'kind' in event && event.phase === 'copy' ? event.bytes_per_second : 0;
-      const points = samples.get(event.target) ?? [];
-      if (Number.isFinite(speed) && speed > 0) {
-        samples.set(event.target, [...points.filter(point => point.time >= speedElapsed - 60).slice(-349), { time: speedElapsed, speed }]);
-      }
       if ('kind' in event) {
-        progress.set(event.target, event);
-        return { ...item, progress, samples, speedStart, speedElapsed };
+        let { samples, readSamples, rates } = item;
+        const previous = progress.get(event.target);
+        const kind = speedKind(event.phase);
+        if (kind && previous?.phase === event.phase && previous.destination === event.destination &&
+          event.bytes > previous.bytes && Number.isFinite(event.bytes_per_second) && event.bytes_per_second > 0) {
+          const buckets = new Map(kind === 'write' ? samples : readSamples);
+          buckets.set(event.target, addSpeedSample(buckets.get(event.target) ?? new Map(),
+            speedElapsed, event.bytes - previous.bytes, event.bytes_per_second));
+          rates = new Map(rates).set(event.target, { ...rates.get(event.target),
+            [kind]: { rate: event.bytes_per_second, time: speedElapsed, destination: event.destination, phase: event.phase } });
+          if (kind === 'write') samples = buckets;
+          else readSamples = buckets;
+        }
+        progress.set(event.target, { ...event, time: speedElapsed });
+        const awaitingVerification = event.phase === 'await_verify'
+          ? new Set(item.awaitingVerification).add(event.destination) : item.awaitingVerification;
+        const sourceHashes = event.source_checksums && Object.keys(event.source_checksums).length
+          ? new Map(item.sourceHashes).set(event.destination, event.source_checksums) : item.sourceHashes;
+        return { ...item, progress, samples, readSamples, rates, awaitingVerification, sourceHashes, speedStart, speedElapsed };
       }
       if (progress.get(event.target)?.destination === event.destination) progress.delete(event.target);
-      return { ...item, progress, samples, speedStart, speedElapsed, outcomes: new Map(item.outcomes).set(event.destination, event) };
+      const awaitingVerification = new Set(item.awaitingVerification);
+      awaitingVerification.delete(event.destination);
+      return { ...item, progress, awaitingVerification, speedStart, speedElapsed, outcomes: new Map(item.outcomes).set(event.destination, event) };
     }));
   }), []);
-  const canvasEdges: Edge[] = edges.map(edge => {
+  const canvasNodes = useMemo(() => nodes.map((node, index) => ({
+    ...node,
+    className: node.height ? node.className + ' path-node-sized' : node.className,
+    zIndex: (node.selected ? 600 : 2) + index + (node.id === frontNode && node.selected ? 300 : 0),
+  })), [nodes, frontNode]);
+  const edgePins = edges.map(edge => {
     const input = port(nodes.find(entry => entry.id === edge.source)?.data.kind);
+    return { ...edge, sourceHandle: edge.sourceHandle ?? 'out', targetHandle: edge.targetHandle ?? input, input };
+  });
+  const pinCounts = new Map<string, number>();
+  const pinKey = (direction: HandleType, nodeId: string, handle: string) => JSON.stringify([direction, nodeId, handle]);
+  for (const edge of edgePins) {
+    const source = pinKey('source', edge.source, edge.sourceHandle);
+    const target = pinKey('target', edge.target, edge.targetHandle);
+    pinCounts.set(source, (pinCounts.get(source) ?? 0) + 1);
+    pinCounts.set(target, (pinCounts.get(target) ?? 0) + 1);
+  }
+  const canvasEdges: Edge[] = edgePins.map(({ input, ...edge }) => {
+    const chosen = edge.selected && selectedEdges.length === 1;
+    const source = chosen || pinCounts.get(pinKey('source', edge.source, edge.sourceHandle)) === 1;
+    const target = chosen || pinCounts.get(pinKey('target', edge.target, edge.targetHandle)) === 1;
     return {
       ...edge,
-      sourceHandle: edge.sourceHandle ?? 'out',
-      targetHandle: edge.targetHandle ?? input,
-      interactionWidth: 26,
-      style: input === 'files' ? { stroke: '#79c9bc' } :
+      interactionWidth: 18,
+      reconnectable: source && target ? true : source ? 'source' : target ? 'target' : false,
+      zIndex: edge.selected ? 1 : 0,
+      style: input === 'operation' ? { stroke: '#f4ca7c' } : input === 'files' ? { stroke: '#79c9bc' } :
         { stroke: input === 'transfer' ? '#e7ac73' : '#adbbeb', strokeDasharray: '5 4' },
     };
   });
   const workflow: Workflow = {
-    version: 3,
+    version: 4,
     nodes: nodes.map(entry => ({
       id: entry.id, kind: entry.data.kind, value: entry.data.value, x: entry.position.x, y: entry.position.y,
+      width: entry.width, height: entry.height, group: entry.data.group, groupName: entry.data.groupName,
     })),
     edges: edges.map(({ id, source, target, sourceHandle, targetHandle }) => ({ id, source, target, sourceHandle, targetHandle })),
   };
-  const targetCounts = new Map<string, { planned: number; processed: number; failures: number; total: number; completed: number; root: string }>();
+  const targetCounts = new Map<string, { planned: number; existing: number; succeeded: number; failed: number; cancelled: number; total: number; completed: number; workTotal: number; workDone: number; root: string }>();
   for (const row of result?.rows ?? []) {
-    const count = targetCounts.get(row.target) ?? { planned: 0, processed: 0, failures: 0, total: 0, completed: 0,
-      root: task?.workflow.nodes.find(node => node.id === row.target)?.value ?? row.target };
+    const count = targetCounts.get(row.target) ?? { planned: 0, existing: 0, succeeded: 0, failed: 0, cancelled: 0, total: 0, completed: 0, workTotal: 0, workDone: 0,
+      root: displayPath(task?.workflow.nodes.find(node => node.id === row.target)?.value ?? row.target) };
     count.planned++;
+    if (row.existing) count.existing++;
     count.total += row.bytes;
     const outcome = outcomes.get(row.destination);
+    const current = running ? progress.get(row.target) : undefined;
+    const work = fileWork(row, task?.verifyOnly === true, outcome?.status,
+      current?.destination === row.destination ? current : undefined,
+      running && task?.awaitingVerification.has(row.destination) === true);
+    count.workTotal += work.total;
+    count.workDone += work.done;
     if (outcome) {
-      count.processed++;
-      if (outcome.status === 'failed' || outcome.status === 'cancelled') count.failures++;
-      else count.completed += row.bytes;
+      if (outcome.status === 'failed') count.failed++;
+      else if (outcome.status === 'cancelled') count.cancelled++;
+      else {
+        count.succeeded++;
+        count.completed += row.bytes;
+      }
     }
     targetCounts.set(row.target, count);
   }
@@ -853,6 +1413,57 @@ function App() {
   function selectGraph(selected: boolean) {
     setNodes(entries => entries.map(node => ({ ...node, selected })));
     setEdges(entries => entries.map(edge => ({ ...edge, selected })));
+  }
+
+  function alignSelection(alignment: Alignment) {
+    const arranging = selectedNodes.length ? selectedNodes : nodes;
+    if (arranging.length < 2) return;
+    const ids = new Set(arranging.map(node => node.id));
+    const box = (node: FlowNode) => ({ id: node.id, ...node.position, ...nodeSize(node) });
+    const positions = alignCanvas(arranging.map(box), nodes.filter(node => !ids.has(node.id)).map(box), alignment, edges);
+    setNodes(items => items.map(node => {
+      const position = positions.get(node.id);
+      return position ? { ...node, position } : node;
+    }));
+    closeMenu();
+  }
+
+  function groupSelection(remove = false) {
+    if (!selectedNodes.length) return;
+    let number = 1;
+    while (groups.has(`组 ${number}`)) number++;
+    const group = remove ? undefined : `组 ${number}`;
+    setNodes(items => items.map(node => node.selected ? { ...node, data: { ...node.data, group, groupName: undefined } } : node));
+    closeMenu();
+  }
+
+  function renameGroup(groupId: string, name: string) {
+    const groupName = name.trim();
+    if (!groupName || groupName.length > 80) return;
+    setNodes(items => items.map(node => node.data.group === groupId
+      ? { ...node, data: { ...node.data, groupName } } : node));
+    closeMenu();
+  }
+
+  function startGroupDrag(event: PointerEvent<HTMLDivElement>, members: FlowNode[]) {
+    if (event.button !== 0) return;
+    event.stopPropagation();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    movingGroup.current = {
+      pointer: event.pointerId, x: event.clientX, y: event.clientY, zoom: flow.current?.getZoom() ?? 1,
+      positions: new Map(members.map(node => [node.id, node.position])),
+    };
+  }
+
+  function moveGroup(event: PointerEvent<HTMLDivElement>) {
+    const dragging = movingGroup.current;
+    if (!dragging || dragging.pointer !== event.pointerId) return;
+    const dx = (event.clientX - dragging.x) / dragging.zoom;
+    const dy = (event.clientY - dragging.y) / dragging.zoom;
+    setNodes(items => items.map(node => {
+      const origin = dragging.positions.get(node.id);
+      return origin ? { ...node, position: { x: origin.x + dx, y: origin.y + dy } } : node;
+    }));
   }
 
   function deleteSelection() {
@@ -894,7 +1505,7 @@ function App() {
     closeMenu();
   }
 
-  function openMenu(event: MouseEvent | globalThis.MouseEvent | TouchEvent, action: Pick<GraphMenu, 'type'> & { pin?: Pin }) {
+  function openMenu(event: MouseEvent | globalThis.MouseEvent | TouchEvent, action: Pick<GraphMenu, 'type' | 'groupId'> & { pin?: Pin }) {
     if (event.cancelable) event.preventDefault();
     const bounds = canvasRef.current?.getBoundingClientRect();
     const cursor = eventPoint(event);
@@ -903,7 +1514,9 @@ function App() {
     const position = flow.current?.screenToFlowPosition({ x, y }) ?? { x: 0, y: 0 };
     setMenuLevel(-1);
     setMenuSearch('');
-    if (action.type === 'pane' || action.type === 'selection') setMenu({ x, y, position, type: action.type });
+    setOrganizeOpen(false);
+    setGroupDraft(undefined);
+    if (action.type === 'pane' || action.type === 'selection') setMenu({ x, y, position, type: action.type, groupId: action.groupId });
     else if (action.pin) setMenu({ x, y, position, type: action.type, pin: action.pin });
   }
 
@@ -915,9 +1528,10 @@ function App() {
   function compatibleNodes(pin: Pin) {
     const owner = nodes.find(node => node.id === pin.nodeId)?.data.kind;
     if (!owner) return [];
+    if (pin.direction === 'source' && owner === 'copy' && edges.some(edge => edge.source === pin.nodeId)) return [];
     return nodeGroups.flatMap(group => group.kinds).filter(kind => {
       if (pin.direction === 'source') return acceptsPort(kind, port(owner), owner);
-      if (owner === 'tree' && kind !== 'source') return false;
+      if (owner === 'tree' && !isFileSource(kind)) return false;
       if (kind === 'target' || port(kind) !== (pin.handle === 'exclude' ? 'files' : filePort(pin.handle))) return false;
       if (owner === 'merge' || owner === 'outputtree') return true;
       return !edges.some(edge => edgeTouchesPin(edge, pin, nodes) &&
@@ -936,7 +1550,15 @@ function App() {
     } else if (!event.ctrlKey && !event.metaKey && !event.altKey && (key === 'delete' || key === 'backspace')) {
       event.preventDefault();
       deleteSelection();
+    } else if (event.altKey && key === 'm') {
+      event.preventDefault();
+      setMinimap(value => !value);
+      setToolMenu(undefined);
+    } else if (!event.ctrlKey && !event.metaKey && !event.altKey && (key === 'v' || key === 'h')) {
+      setCanvasMode(key === 'v' ? 'select' : 'hand');
+      setToolMenu(undefined);
     } else if (key === 'escape') {
+      if (toolMenu) { setToolMenu(undefined); return; }
       if (menu) { closeMenu(); return; }
       selectGraph(false);
     }
@@ -966,6 +1588,25 @@ function App() {
     setTasks(items => items.map(item => item.plan.id === id ? { ...item, ...change } : item));
   }
 
+  async function controlTask(id: string, action: 'pause' | 'resume' | 'cancel') {
+    if (!await window.filebraid.control(id, action)) return;
+    const time = performance.now();
+    setTasks(items => items.map(item => {
+      if (item.plan.id !== id || item.status !== 'running') return item;
+      if (action !== 'resume') return { ...item, control: action === 'pause' ? 'paused' : 'cancelling' };
+      const elapsed = item.speedStart === undefined ? 0 : (time - item.speedStart) / 1000;
+      return { ...item, control: undefined, progress: new Map([...item.progress].map(([target, event]) =>
+        [target, { ...event, time: Math.max(event.time, elapsed) }])) };
+    }));
+  }
+
+  async function resetTask(item: QueueTask) {
+    const plan = await window.filebraid.preview(item.workflow);
+    await window.filebraid.removeTask(item.plan.id);
+    setTasks(tasks => tasks.map(task => task.plan.id === item.plan.id ? waitingTask(plan, item.workflow, item.name) : task));
+    setSelectedTask(id => id === item.plan.id ? plan.id : id);
+  }
+
   async function runTasks(pending: QueueTask[], verifyOnly = false) {
     if (!pending.length || queueRunning) return;
     stopQueue.current = false;
@@ -975,21 +1616,18 @@ function App() {
         if (stopQueue.current) break;
         const id = item.plan.id;
         setSelectedTask(id);
-        updateTask(id, { status: 'running', message: undefined });
+        updateTask(id, { status: 'running', message: undefined, verifyOnly, control: undefined });
         try {
           const summary = await window.filebraid.execute(id, verifyOnly);
-          if (!summary) {
-            updateTask(id, { status: 'waiting' });
-            break;
-          }
-          const incomplete = summary.outcomes.filter(outcome => outcome.status === 'failed' || outcome.status === 'cancelled').length;
-          const cancelled = summary.outcomes.some(outcome => outcome.status === 'cancelled');
+          const failures = summary.outcomes.filter(outcome => outcome.status === 'failed').length;
+          const cancelled = summary.outcomes.filter(outcome => outcome.status === 'cancelled').length;
+          const incomplete = [failures ? `${failures} 项失败` : '', cancelled ? `${cancelled} 项已取消` : ''].filter(Boolean).join('，');
           const unverified = summary.outcomes.filter(outcome => outcome.status === 'copied').length;
           updateTask(id, {
             status: cancelled ? 'cancelled' : incomplete ? 'failed' : 'finished',
             outcomes: new Map(summary.outcomes.map(outcome => [outcome.destination, outcome])),
-            progress: new Map(), report: true,
-            message: incomplete ? `${incomplete} 条输出失败或中止。`
+            progress: new Map(), awaitingVerification: new Set(), report: true,
+            message: incomplete ? `${incomplete}。`
               : unverified === 0 ? '全部输出已校验。'
               : unverified === summary.outcomes.length ? '复制完成，未校验。' : '复制完成，部分未校验。',
           });
@@ -1007,7 +1645,8 @@ function App() {
     const from = nodes.find(entry => entry.id === connection.source)?.data.kind;
     const target = nodes.find(entry => entry.id === connection.target)?.data;
     const to = target?.kind;
-    if (!from || !to || connection.source === connection.target || from === 'target' || to === 'source' || port(to) !== 'files') return false;
+    if (!from || !to || connection.source === connection.target || from === 'target') return false;
+    if (from === 'camera' && !sonyOutputs.some(output => output.id === (connection.sourceHandle ?? 'out'))) return false;
     const input = port(from);
     const handle = connection.targetHandle ?? input;
     const targetPort = filePort(handle);
@@ -1016,6 +1655,7 @@ function App() {
       !outputFolders(target.value).some(folder => `folder:${folder.id}` === handle))) return false;
     if (handle.startsWith('disk:') && (to !== 'outputtree' || !destinationFolders.get(connection.target))) return false;
     const remainingEdges = edges.filter(edge => edge.id !== reconnecting.current);
+    if (from === 'copy' && remainingEdges.some(edge => edge.source === connection.source)) return false;
     const pending = [connection.target];
     const visited = new Set<string>();
     while (pending.length > 0) {
@@ -1065,21 +1705,26 @@ function App() {
               setMessage(`已载入上次任务（${status}，已记录 ${job.count} 项）。请重新加入队列，复制时会重新校验已有文件。`);
             })}>载入上次任务</button>
           </div>}
-          {view === 'workflow' && <button className="primary queue-entry" disabled={busy} onClick={() => void perform(async () => {
+          {view === 'workflow' && <button className="primary queue-entry" disabled={busy} aria-busy={busy} onClick={() => void perform(async () => {
               const configured = copyStrategies(workflow.nodes, workflow.edges);
-              const missing = workflow.nodes.filter(node => node.kind === 'target' && !configured.has(node.id));
-              if (missing.length) {
-                throw new Error(`有 ${missing.length} 个「文件输出」未连接复制策略。请连接「标准复制」或「快速流复制」。`);
+              const copies = workflow.nodes.filter(node => node.kind === 'copy');
+              if (copies.some(node => !configured.has(node.id))) {
+                throw new Error(`请为每个「${labels.copy}」连接「${labels.standardcopy}」或「${labels.fastcopy}」。`);
+              }
+              const bound = workflow.edges.filter(edge => copies.some(node => node.id === edge.source));
+              if (copies.some(node => !bound.some(edge => edge.source === node.id)) ||
+                workflow.nodes.some(node => node.kind === 'target' && !bound.some(edge => edge.target === node.id))) {
+                throw new Error(`请将「${labels.copy}」的「输出文件」连接到对应「${labels.target}」的「文件」端口。`);
               }
               const plan = await window.filebraid.preview(workflow);
-              setTasks(items => [...items, { plan, workflow, name: workflowName, status: 'waiting', outcomes: new Map(), progress: new Map(), samples: new Map() }]);
+              setTasks(items => [...items, waitingTask(plan, workflow, workflowName)]);
               setSelectedTask(plan.id);
               setView('queue');
           })}>{busy ? '处理中…' : '加入队列'}</button>}
         </div>
       </header>
       {view === 'workflow' && <>
-      <NodeActions.Provider value={{ update, busy, treeFolders: linkedFolders, destinationFolders, disconnect: disconnectPin,
+      <NodeActions.Provider value={{ update, busy, treeFolders: linkedFolders, sonySources, destinationFolders, disconnect: disconnectPin,
         removeFolderConnections: (id, folders) => setEdges(items => items.filter(edge =>
           edge.target !== id || !edge.targetHandle?.startsWith('folder:') || !folders.has(edge.targetHandle.slice(7)))),
         pinMenu: (event, pin) => openMenu(event, { type: 'pin', pin }), chooseDirectory: id => void perform(async () => {
@@ -1097,18 +1742,14 @@ function App() {
               <WorkflowLibrary busy={busy}
                 openWorkflow={() => void perform(async () => {
                   const value = await window.filebraid.open();
-                  if (value !== null) {
-                    const opened = decode(value);
-                    await window.filebraid.clearRecovery();
-                    replace(opened);
-                  }
+                  if (value !== null) replace(decode(value));
                 })}
                 saveWorkflow={() => void perform(async () => {
                   if (await window.filebraid.save(workflow)) setMessage('工作流已保存。');
                 })}
                 load={(name, id) => void perform(async () => {
-                  const next = id ? decode(await window.filebraid.openLibraryWorkflow(id)) : officialWorkflow;
-                  await window.filebraid.clearRecovery();
+                  const next = id ? decode(await window.filebraid.openLibraryWorkflow(id))
+                    : name === sonyWorkflowName ? sonyWorkflow : officialWorkflow;
                   replace(next, name);
                 })}
                 save={(name, added) => void perform(async () => {
@@ -1145,10 +1786,16 @@ function App() {
                 canvasRef.current?.focus({ preventScroll: true });
               }
             }}>
-            <ReactFlow nodes={nodes} edges={canvasEdges} nodeTypes={nodeTypes} onNodesChange={changeNodes} onEdgesChange={changeEdges}
+            <ReactFlow<FlowNode, Edge> className={`${compact ? 'compact-canvas' : ''} ${showLinks ? '' : 'canvas-hide-edges'}`}
+              nodes={canvasNodes} edges={canvasEdges} nodeTypes={nodeTypes} onNodesChange={changeNodes} onEdgesChange={changeEdges}
               onInit={instance => { flow.current = instance; }}
+              onMove={(_, viewport) => { setCompact(viewport.zoom < 0.35); setCanvasZoom(viewport.zoom); }}
+              onNodeClick={(_, node) => setFrontNode(node.id)}
+              onNodeDragStart={(_, node) => { closeMenu(); setFrontNode(node.id); }}
+              zIndexMode="manual" minZoom={0.08}
               onPaneContextMenu={event => openMenu(event, { type: 'pane' })}
               onNodeContextMenu={(event, node) => {
+                setFrontNode(node.id);
                 if (!node.selected) {
                   setNodes(items => items.map(item => ({ ...item, selected: item.id === node.id })));
                   setEdges(items => items.map(item => ({ ...item, selected: false })));
@@ -1178,16 +1825,81 @@ function App() {
                 if (!state.isValid && isBlankDrop(event)) setEdges(items => items.filter(item => item.id !== edge.id));
               }}
               edgesReconnectable reconnectRadius={12} connectOnClick={false}
-              selectionMode={SelectionMode.Partial} panOnDrag={[0, 1]}
+              selectionMode={SelectionMode.Partial} selectionOnDrag={canvasMode === 'select'} panOnDrag={canvasMode === 'hand' ? [0, 1] : [1]}
               selectionKeyCode="Control" multiSelectionKeyCode={['Shift', 'Meta']}
-              selectNodesOnDrag={false} deleteKeyCode={null}
-              colorMode="dark" fitView fitViewOptions={{ padding: 0.2 }}>
+              selectNodesOnDrag nodeDragThreshold={2} deleteKeyCode={null}
+              colorMode="dark" attributionPosition="top-right" fitView fitViewOptions={{ padding: 0.2 }}>
               <Background gap={20} size={1} color="#4d6071" />
-              <Controls showInteractive={false} />
+              <ViewportPortal>
+                {groupBoxes.map(({ group, name, members, box }) => {
+                  return <div className="workflow-group nodrag nopan" key={group} style={box} title={`${name} · 拖动标题栏移动，右键重命名`}
+                    onPointerDown={event => startGroupDrag(event, members)} onPointerMove={moveGroup}
+                    onLostPointerCapture={() => { movingGroup.current = null; }}
+                    onContextMenu={event => {
+                      event.stopPropagation();
+                      setNodes(items => items.map(node => ({ ...node, selected: node.data.group === group })));
+                      setEdges(items => items.map(edge => ({ ...edge, selected: false })));
+                      openMenu(event, { type: 'selection', groupId: group });
+                    }}>
+                    <div className="workflow-group-name">{name}</div>
+                  </div>;
+                })}
+              </ViewportPortal>
+              {minimap && mapHost && createPortal(<GraphMap nodes={canvasNodes} edges={canvasEdges}
+                groups={groupBoxes.map(group => group.box)} options={mapOptions} />, mapHost)}
             </ReactFlow>
-            <div className="canvas-status" role="status">{hasSelection
-              ? `已选 ${selectedNodes.length} 个节点、${selectedEdges.length} 条连线`
-              : '左键平移 · Ctrl 拖动框选 · 右键菜单'}</div>
+          <div className="canvas-tool-dock">
+            {minimap && <div className="canvas-map-row">
+              {toolMenu === 'map' && <div className="canvas-map-settings" aria-label="小地图图层">
+                {([['color', '节点颜色'], ['edges', '显示连接'], ['groups', '显示框架／分组']] as const).map(([key, title]) =>
+                  <label key={key}><input type="checkbox" checked={mapOptions[key]}
+                    onChange={event => setMapOptions({ ...mapOptions, [key]: event.target.checked })} />{title}</label>)}
+                <label title="当前工作流没有节点绕过状态"><input type="checkbox" disabled />渲染绕过状态</label>
+                <label title="当前没有节点级错误图层"><input type="checkbox" disabled />渲染错误状态</label>
+              </div>}
+              <div className="canvas-map-panel">
+                <div className="canvas-map-header">
+                  <button type="button" aria-label="小地图设置" aria-expanded={toolMenu === 'map'} title="小地图设置"
+                    onClick={() => setToolMenu(toolMenu === 'map' ? undefined : 'map')}><CanvasIcon name="settings" /></button>
+                  <button type="button" aria-label="关闭小地图" title="关闭小地图" onClick={() => { setMinimap(false); setToolMenu(undefined); }}>
+                    <CanvasIcon name="close" /></button>
+                </div>
+                <div className="canvas-map-host" ref={setMapHost} />
+              </div>
+            </div>}
+            <div className="canvas-tool-row">
+              <div className="canvas-status" role="status">{hasSelection
+                ? `已选 ${selectedNodes.length} 个节点、${selectedEdges.length} 条连线`
+                : canvasMode === 'hand' ? '左键平移 · Ctrl 拖动框选' : '左键框选 · 中键平移'}</div>
+              <div className="canvas-toolbar" role="toolbar" aria-label="画布工具">
+                {toolMenu === 'mode' && <div className="canvas-tool-popup">
+                  <button onClick={() => { setCanvasMode('select'); setToolMenu(undefined); }}><CanvasIcon name="select" />选择<kbd>V</kbd></button>
+                  <button onClick={() => { setCanvasMode('hand'); setToolMenu(undefined); }}><CanvasIcon name="hand" />拖拽<kbd>H</kbd></button>
+                </div>}
+                {toolMenu === 'zoom' && <div className="canvas-tool-popup zoom-popup">
+                  {[0.08, 0.25, 0.5, 0.75, 1, 1.5, 2].map(zoom => <button key={zoom} onClick={() => {
+                    void flow.current?.zoomTo(zoom, { duration: 180 });
+                    setToolMenu(undefined);
+                  }}>{Math.round(zoom * 100)}%</button>)}
+                </div>}
+                <button type="button" className="canvas-tool-mode" aria-label="选择或拖拽" title="选择或拖拽（V／H）"
+                  aria-expanded={toolMenu === 'mode'} onClick={() => setToolMenu(toolMenu === 'mode' ? undefined : 'mode')}>
+                  <CanvasIcon name={canvasMode} /><CanvasIcon name="chevron" /></button>
+                <span className="canvas-tool-divider" />
+                <button type="button" aria-label="适配视图" title="适配视图" onClick={() => {
+                  void flow.current?.fitView({ padding: 0.2, duration: 180 });
+                  setToolMenu(undefined);
+                }}><CanvasIcon name="fit" /></button>
+                <button type="button" aria-label="缩放比例" aria-expanded={toolMenu === 'zoom'} title="缩放比例"
+                  onClick={() => setToolMenu(toolMenu === 'zoom' ? undefined : 'zoom')}>{Math.round(canvasZoom * 100)}% <CanvasIcon name="chevron" /></button>
+                <span className="canvas-tool-divider" />
+                <button type="button" aria-label="小地图" title="小地图（Alt+M）" aria-pressed={minimap}
+                  onClick={() => { setMinimap(value => !value); setToolMenu(undefined); }}><CanvasIcon name="map" /></button>
+                <button type="button" aria-label="显示画布连线" title={showLinks ? '隐藏画布连线' : '显示画布连线'} aria-pressed={showLinks}
+                  onClick={() => setShowLinks(value => !value)}><CanvasIcon name={showLinks ? 'link' : 'unlink'} /></button>
+              </div>
+            </div>
+          </div>
           </div>
           {menu && <>
             <div className="graph-menu-backdrop" onPointerDown={closeMenu} onContextMenu={event => event.preventDefault()} />
@@ -1199,16 +1911,15 @@ function App() {
                   addNode(filteredNodes[0], menu.position, menu.pin);
                 }
               }}
-              style={{ left: menuLeft, top: Math.max(8, Math.min(menu.y, window.innerHeight -
-                (menu.type === 'connection' ? 320 : menu.type === 'pane' ? 260 : 105))) }}>
-              {menu.type === 'pane' ? <>
+              style={{ left: menuLeft, top: Math.max(8, Math.min(menu.y, window.innerHeight - 320)) }}>
+              {menu.type === 'pane' || menu.type === 'selection' ? <>
                 <div className="menu-branch" onMouseEnter={() => setMenuLevel(level => level < 0 ? 0 : level)}>
-                  <button aria-expanded={menuLevel >= 0} onClick={() => setMenuLevel(level => Math.max(0, level))}>添加节点 <kbd>›</kbd></button>
+                  <button aria-expanded={menuLevel >= 0} onClick={() => setMenuLevel(level => Math.max(0, level))}>添加节点 <span className="menu-submenu-arrow" aria-hidden="true" /></button>
                   {menuLevel >= 0 && <div className="graph-menu-subpanel">
                     {nodeGroups.map((group, index) => <div key={group.title} className="menu-branch"
                       onMouseEnter={() => setMenuLevel(index + 1)}>
                       <button aria-expanded={menuLevel === index + 1} onClick={() => setMenuLevel(index + 1)}>
-                        {group.title} <kbd>›</kbd>
+                        {group.title} <span className="menu-submenu-arrow" aria-hidden="true" />
                       </button>
                       {menuLevel === index + 1 && <div className={`graph-menu-subpanel leaf ${(menuDirection === 'right' ? menuLeft + 694 > window.innerWidth : menuLeft < 450) ? 'leaf-flip' : ''}`}>
                         {group.kinds.map(kind => <button key={kind} onClick={() => addNode(kind, menu.position)}>{labels[kind]}</button>)}
@@ -1217,24 +1928,59 @@ function App() {
                   </div>}
                 </div>
                 <button onMouseEnter={() => setMenuLevel(-1)} onClick={() => { void flow.current?.fitView(); closeMenu(); }}>适配视图</button>
+                <div className="menu-branch graph-organize"
+                  onMouseEnter={() => { setMenuLevel(-1); setOrganizeOpen(true); }}
+                  onMouseLeave={() => setOrganizeOpen(false)}>
+                  <button aria-expanded={organizeOpen} onClick={() => { setMenuLevel(-1); setOrganizeOpen(true); }}>
+                    整理 <span className="menu-submenu-arrow" aria-hidden="true" />
+                  </button>
+                  {organizeOpen && <div className="graph-menu-subpanel organize-actions">
+                    <div className="organize-scope">{selectedNodes.length ? '所选节点' : '全部节点'}</div>
+                    {([['left', '左对齐'], ['center', '水平居中'], ['right', '右对齐'],
+                      ['top', '顶对齐'], ['middle', '垂直居中'], ['bottom', '底对齐']] as const).map(([key, title]) =>
+                        <button key={key} disabled={(selectedNodes.length || nodes.length) < 2} onClick={() => alignSelection(key)}>{title}</button>)}
+                  </div>}
+                </div>
+                {menu.groupId && (groupDraft === undefined
+                  ? <button onClick={() => setGroupDraft(groupBoxes.find(box => box.group === menu.groupId)?.name ?? menu.groupId)}>重命名组</button>
+                  : <form className="group-rename" onSubmit={event => {
+                    event.preventDefault();
+                    if (menu.groupId) renameGroup(menu.groupId, groupDraft);
+                  }}>
+                    <label>组名称<input autoFocus value={groupDraft} maxLength={80}
+                      onFocus={event => event.target.select()} onChange={event => setGroupDraft(event.target.value)} /></label>
+                    <button type="submit" disabled={!groupDraft.trim()}>保存名称</button>
+                  </form>)}
+                {selectedNodes.length > 1 && <button onClick={() => groupSelection()}>将所选节点建组</button>}
+                {selectedNodes.some(node => node.data.group) && <button onClick={() => groupSelection(true)}>将所选节点移出组</button>}
+                {hasSelection && <button onClick={() => { deleteSelection(); closeMenu(); }}>
+                  {selectedNodes.length === 0 && selectedEdges.length === 1 ? '删除连线'
+                    : selectedNodes.length === 1 && selectedEdges.length === 0 ? '删除节点' : '删除所选'}<kbd>Delete</kbd>
+                </button>}
               </> : menu.type === 'connection' ? <div className="compatible-menu">
                 <div className="graph-menu-title">
-                  {portLabels[menu.pin.direction === 'target' ? filePort(menu.pin.handle) ?? 'files' : port(nodes.find(node => node.id === menu.pin.nodeId)?.data.kind)]} · 兼容节点
+                  {portLabel(nodes.find(node => node.id === menu.pin.nodeId)?.data.kind, menu.pin.direction, menu.pin.handle)} · 兼容节点
                 </div>
                 <input type="search" aria-label="搜索兼容节点" placeholder="搜索兼容节点…" value={menuSearch}
                   onChange={event => setMenuSearch(event.target.value)} />
                 {filteredNodes.map(kind => <button key={kind} onClick={() => addNode(kind, menu.position, menu.pin)}>{labels[kind]}</button>)}
                 {!filteredNodes.length && <p>没有匹配的兼容节点。</p>}
               </div> : menu.type === 'pin' ? <>
+                <div className="pin-connections">
+                {edges.filter(edge => edgeTouchesPin(edge, menu.pin, nodes)).map((edge, index) => {
+                  const other = nodes.find(node => node.id === (menu.pin.direction === 'source' ? edge.target : edge.source));
+                  return <button key={edge.id} title="选中后拖动连线端点" onClick={() => {
+                    setEdges(items => items.map(item => ({ ...item, selected: item.id === edge.id })));
+                    setNodes(items => items.map(node => ({ ...node, selected: false })));
+                    closeMenu();
+                  }}>选中连线 {index + 1} · {other ? labels[other.data.kind] : ''}</button>;
+                })}
+                </div>
                 <button disabled={!connectedCount} onClick={() => disconnectPin(menu.pin)}>
                   断开端口连线{connectedCount ? `（${connectedCount}）` : ''}<kbd>Alt + 单击</kbd>
                 </button>
                 <button onClick={closeMenu}>关闭菜单</button>
-              </> : <button disabled={!hasSelection} onClick={() => { deleteSelection(); closeMenu(); }}>
-                {selectedNodes.length === 0 && selectedEdges.length === 1 ? '删除连线'
-                  : selectedNodes.length === 1 && selectedEdges.length === 0 ? '删除节点' : '删除所选'}
-                <kbd>Delete</kbd>
-              </button>}
+              </> : null}
             </div>
           </>}
         </section>
@@ -1245,7 +1991,7 @@ function App() {
       {view === 'queue' && <div className="queue-view">
         <aside className="queue-list" aria-label="任务列表">
           <div className="queue-list-actions">
-            <button className="primary" disabled={queueRunning || !waiting.length}
+            <button className="primary" disabled={busy || queueRunning || !waiting.length} aria-busy={queueRunning}
               onClick={() => void runTasks(waiting)}>运行队列</button>
             {queueRunning && <button onClick={() => {
               stopQueue.current = true;
@@ -1255,7 +2001,7 @@ function App() {
           {tasks.map((item, index) => <button className="queue-item" key={item.plan.id} aria-pressed={item.plan.id === selectedTask}
             onClick={() => setSelectedTask(item.plan.id)}>
             <strong>{item.name || `任务 ${index + 1}`}</strong>
-            <span>{queueLabels[item.status]} · {item.plan.rows.length} 条输出</span>
+            <span>{item.status === 'running' && item.control ? (item.control === 'paused' ? '已暂停' : '正在取消') : queueLabels[item.status]} · {item.plan.rows.length} 条输出</span>
           </button>)}
           {tasks.length === 0 && <p>在工作流页点击「加入队列」。</p>}
         </aside>
@@ -1264,9 +2010,18 @@ function App() {
           {task && result && <>
           <h2>任务详情 <small>{result.rows.length} 条输出 / {result.excluded.length} 个文件在至少一条路径被排除</small></h2>
           <div className="actions queue-task-actions">
-            <button disabled={queueRunning || task.status !== 'waiting'} onClick={() => void runTasks([task])}>开始复制</button>
-            <button disabled={queueRunning || task.status !== 'waiting'} onClick={() => void runTasks([task], true)}>仅复验</button>
-            <button disabled={queueRunning} onClick={() => void perform(async () => {
+            {running && <>
+              <button className="primary" disabled={busy || task.speedStart === undefined || task.control === 'cancelling'}
+                onClick={() => void perform(() => controlTask(result.id, task.control === 'paused' ? 'resume' : 'pause'))}>
+                {task.control === 'paused' ? '继续' : '暂停'}</button>
+              <button disabled={busy || task.speedStart === undefined || task.control === 'cancelling'}
+                onClick={() => void perform(() => controlTask(result.id, 'cancel'))}>取消任务</button>
+            </>}
+            <button disabled={busy || queueRunning || task.status !== 'waiting'} onClick={() => void runTasks([task])}>开始复制</button>
+            <button disabled={busy || queueRunning || task.status !== 'waiting'} onClick={() => void runTasks([task], true)}>仅复验</button>
+            {task.status !== 'waiting' && !running && <button disabled={queueRunning || busy}
+              onClick={() => void perform(() => resetTask(task))}>重置任务</button>}
+            <button disabled={queueRunning || busy} onClick={() => void perform(async () => {
               await window.filebraid.removeTask(result.id);
               setTasks(items => items.filter(item => item.plan.id !== result.id));
               setSelectedTask(tasks.find(item => item.plan.id !== result.id)?.plan.id);
@@ -1274,28 +2029,54 @@ function App() {
           </div>
           {task.message && <p role="status" className={task.status === 'failed' ? 'error' : undefined}>{task.message}</p>}
           {message && <p role={failed ? 'alert' : 'status'} className={failed ? 'error' : undefined}>{message}</p>}
-          {(running || task.samples.size > 0) && <SpeedChart samples={task.samples} targets={[...targetCounts.keys()]} elapsed={task.speedElapsed ?? 0} />}
-          {(running || outcomes.size > 0) && <div className="transfer-targets">
+          <div className="queue-overview" aria-label="目标与传输速度">
+          {(running || task.samples.size > 0 || task.readSamples.size > 0) && <SpeedChart key={result.id}
+            samples={task.samples} readSamples={task.readSamples} targets={[...targetCounts.keys()]} duration={duration} progress={progress}
+            readOnly={task.verifyOnly === true || result.rows.every(row => row.existing)}
+            live={running ? {
+              write: [...targetCounts.keys()].reduce((sum, id) => sum + targetSpeed(id, 'write'), 0),
+              read: [...targetCounts.keys()].reduce((sum, id) => sum + targetSpeed(id, 'read'), 0),
+            } : undefined}
+            activity={running ? task.control === 'paused' ? '已暂停' : task.control === 'cancelling' ? '正在取消'
+              : [...progress.values()].some(event => event.phase === 'copy') ? '正在复制'
+              : [...progress.values()].some(event => event.phase === 'source') ? '正在读取来源，用于复验已有文件'
+              : [...progress.values()].some(event => event.phase === 'verify') ? '正在校验目标文件'
+              : [...progress.values()].some(event => event.phase === 'flush') ? '正在写入磁盘'
+              : '正在准备文件' : undefined} />}
+          {targetCounts.size > 0 && <div className="transfer-targets">
             {[...targetCounts].map(([target, count], index) => {
               const current = running ? progress.get(target) : undefined;
               const row = current && result.rows.find(entry => entry.destination === current.destination);
+              const writeSpeed = targetSpeed(target, 'write');
+              const readSpeed = targetSpeed(target, 'read');
+              const lastWrite = task.rates.get(target)?.write;
               return <div className="transfer-target" key={target}>
                 <strong title={count.root}>目标 {index + 1} · {count.root}</strong>
-                <span>{count.processed}/{count.planned} 项 · {byteSize(count.completed)} / {byteSize(count.total)}
-                  {count.failures ? ` · ${count.failures} 项未完成` : ''}</span>
-                <progress aria-label={`目标 ${index + 1} 已处理文件`} max={count.planned} value={count.processed} />
+                <span>{task.verifyOnly ? '仅复验' : `预览：${count.planned - count.existing} 项待新写入 · ${count.existing} 项已有文件`}</span>
+                {running && <span className="live-target-speed">
+                  {writeSpeed > 0 ? `复制写入 ${byteSize(writeSpeed)}/s`
+                    : lastWrite ? `最近写入 ${byteSize(lastWrite.rate)}/s`
+                      : current?.phase === 'copy' ? '写入采样中'
+                      : task.verifyOnly || count.planned === count.existing ? '无新写入' : '等待写入'}
+                  {current && speedKind(current.phase) === 'read' && ` · 校验读取 ${readSpeed > 0
+                    ? byteSize(readSpeed) + '/s' : '采样中'}`}
+                </span>}
+                <span>{count.succeeded}/{count.planned} 项已完成 · {byteSize(count.completed)} / {byteSize(count.total)}
+                  {count.failed ? ` · ${count.failed} 项失败` : ''}{count.cancelled ? ` · ${count.cancelled} 项已取消` : ''}</span>
+                <span>总进度 {Math.floor(100 * count.workDone / count.workTotal)}%</span>
+                <progress aria-label={`目标 ${index + 1} 总进度`} max={count.workTotal} value={count.workDone} />
                 {current && row && <>
-                  <span className="transfer-file" title={row.source}>
-                    {phases[current.phase]} · {row.source.split(/[\\/]/).at(-1)}
+                  <span className="transfer-file" title={displayPath(row.source)}>
+                    {task.control === 'paused' ? '已暂停' : phases[current.phase]} · {row.source.split(/[\\/]/).at(-1)}
                   </span>
-                  <span>{byteSize(Math.min(current.bytes, row.bytes))} / {byteSize(row.bytes)}
-                    {current.bytes_per_second > 0 ? ` · ${byteSize(current.bytes_per_second)}/s` : ''}</span>
+                  <span>{byteSize(Math.min(current.bytes, row.bytes))} / {byteSize(row.bytes)}</span>
                   <progress aria-label={`目标 ${index + 1} 当前文件`} max={row.bytes || 1}
                     value={Math.min(current.bytes, row.bytes)} />
                 </>}
               </div>;
             })}
           </div>}
+          </div>
           {task.report && !running && <div className="actions">
             {(['html', 'json'] as const).map(format => <button key={format} disabled={busy}
               onClick={() => void window.filebraid.report(result.id, format).catch(cause => {
@@ -1303,14 +2084,29 @@ function App() {
                 setMessage(`报告导出失败：${cause instanceof Error ? cause.message : cause}`);
               })}>导出 {format.toUpperCase()}</button>)}
           </div>}
-          <div className="table">
-            <table><thead><tr><th>来源</th><th>目标路径</th><th>大小</th><th>复制策略</th><th>校验策略</th><th>结果</th></tr></thead>
-              <tbody>{result.rows.slice(0, 200).map(row => {
+          <FileStatusGuide />
+          <QueueFileList plan={result} activePath={running ? progress.values().next().value?.destination : undefined}
+            renderRow={(row, index) => {
                 const outcome = outcomes.get(row.destination);
                 const current = running ? progress.get(row.target) : undefined;
-                const activePhase = current?.destination === row.destination ? phases[current.phase] : undefined;
-                return <tr key={row.destination}>
-                <td title={row.source}>{row.source}</td><td title={row.destination}>{row.destination}</td>
+                const phase = current?.destination === row.destination ? current.phase
+                  : running && task.awaitingVerification.has(row.destination) ? 'await_verify' : undefined;
+                const state = outcome?.status ?? phase ?? 'pending';
+                const active = !outcome && current?.destination === row.destination && current.phase !== 'await_verify' ? current : undefined;
+                const percent = active ? active.phase === 'flush' ? 100
+                  : row.bytes > 0 ? Math.floor(100 * Math.max(0, Math.min(active.bytes, row.bytes)) / row.bytes) : 0 : undefined;
+                const status = outcome ? outcomeLabels[outcome.status]
+                  : active && task.control === 'paused' ? '已暂停'
+                    : phase ? phases[phase] : row.existing ? '已有文件，待检查' : '待复制';
+                const source = outcome?.source_checksums && Object.keys(outcome.source_checksums).length
+                  ? outcome.source_checksums : task.sourceHashes.get(row.destination);
+                const target = outcome?.target_checksums;
+                const algorithm = row.verified_by.find(name => source?.[name] || target?.[name])
+                  ?? Object.keys(source ?? target ?? {})[0];
+                const comparison = algorithm && source?.[algorithm] && target?.[algorithm]
+                  ? source[algorithm] === target[algorithm] ? 'match' : 'mismatch' : undefined;
+                return <tr key={row.destination} className="file-list-row" aria-rowindex={index + 2}>
+                <td title={displayPath(row.source)}>{displayPath(row.source)}</td><td title={displayPath(row.destination)}>{displayPath(row.destination)}</td>
                 <td>{byteSize(row.bytes)}</td><td title={row.copy_settings ? `I/O 块 ${row.copy_settings.block_mib} MiB` : undefined}>
                   {!row.copy_settings ? labels.standardcopy
                     : row.bytes <= Math.max(row.copy_settings.small_file_kib * 1024, row.copy_settings.block_mib * 1024 ** 2) ? '轻量流'
@@ -1321,13 +2117,13 @@ function App() {
                 <td title={row.verified_by.join('、')}>{row.verified_by.join('、') || '未选'}
                   {row.verify_timing && <span className="verify-timing-note">{verifyTimingLabels[row.verify_timing]}</span>}
                 </td>
-                <td title={outcome?.error ?? Object.entries(outcome?.checksums ?? {}).map(([name, digest]) => `${name}: ${digest}`).join('\n')}>{outcome ? outcomeLabels[outcome.status] : activePhase ?? (row.existing ? '已有文件，待检查' : '待复制')}</td>
-              </tr>; })}</tbody>
-            </table>
-          </div>
-          {result.rows.length > 200 && <p>显示前 200 条输出。</p>}
-          {result.excluded.length > 0 && <details><summary>查看排除项</summary>
-            <ul>{result.excluded.slice(0, 200).map(path => <li key={path}>{path}</li>)}</ul>
+                <HashCell sums={source} algorithm={algorithm} label="来源哈希" comparison={comparison} />
+                <HashCell sums={target} algorithm={algorithm} label="目标哈希" comparison={comparison} />
+                <FileStatus state={state} status={status} percent={percent} error={outcome?.error} />
+              </tr>;
+            }} />
+          {result.excluded.length > 0 && <details className="queue-excluded"><summary>查看排除项</summary>
+            <ul>{result.excluded.slice(0, 200).map(path => <li key={path}>{displayPath(path)}</li>)}</ul>
             {result.excluded.length > 200 && <p>显示前 200 项。</p>}
           </details>}
           </>}

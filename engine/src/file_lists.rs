@@ -1,10 +1,9 @@
-use super::{component_allowed, disk_folder, error, expand_component, is_link, key, root, scan, Edge, Kind, Node};
+use super::{component_allowed, disk_folder, error, expand_component, is_link, key, root, scan, sony, Edge, Kind, ModificationTime, Node};
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     rc::Rc,
-    time::SystemTime,
 };
 
 #[derive(Clone)]
@@ -15,12 +14,12 @@ pub struct Item {
     pub relative: PathBuf,
     selection_parent: PathBuf,
     pub bytes: u64,
-    pub modified: SystemTime,
-    pub camera: bool,
+    pub modified: ModificationTime,
+    pub camera: Option<sony::Category>,
     filtered: bool,
 }
 
-type Inventory = Vec<(PathBuf, u64, SystemTime)>;
+type Inventory = Vec<(PathBuf, u64, ModificationTime)>;
 type List = Rc<Vec<Item>>;
 
 #[derive(serde::Deserialize)]
@@ -28,6 +27,19 @@ struct OutputFolder {
     id: String,
     parent: Option<String>,
     name: String,
+}
+
+pub(crate) fn probe_sony(folder: &str, output: &str) -> Result<bool, String> {
+    if output != "out" && !output.starts_with("item:") { return Err("无效的文件输出端口。".into()); }
+    let nodes = HashMap::new();
+    let inputs = HashMap::new();
+    let mut lists = FileLists::new(&nodes, &inputs, None);
+    let files = lists.source(folder, output)?;
+    match sony::classify(&files) {
+        Ok(_) => Ok(true),
+        Err(error) if error == sony::UNRECOGNIZED => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 pub struct FileLists<'a> {
@@ -39,13 +51,14 @@ pub struct FileLists<'a> {
     cached_items: usize,
     pub scans: HashMap<PathBuf, Inventory>,
     pub excluded: BTreeSet<PathBuf>,
+    pub sony_split_sources: BTreeSet<PathBuf>,
 }
 
 impl<'a> FileLists<'a> {
     pub fn new(nodes: &'a HashMap<&'a str, &'a Node>, inputs: &'a HashMap<&'a str, Vec<&'a Edge>>,
         legacy_parameters: Option<&'a HashMap<String, String>>) -> Self {
         Self { nodes, inputs, legacy_parameters, visiting: HashSet::new(), cached: HashMap::new(),
-            cached_items: 0, scans: HashMap::new(), excluded: BTreeSet::new() }
+            cached_items: 0, scans: HashMap::new(), excluded: BTreeSet::new(), sony_split_sources: BTreeSet::new() }
     }
 
     fn folder_name(&self, name: &str) -> Result<String, String> {
@@ -55,7 +68,7 @@ impl<'a> FileLists<'a> {
     }
 
     pub fn target_files(&mut self, id: &'a str) -> Result<List, String> {
-        self.input(id, "files")?.ok_or_else(|| "文件输出必须连接到来源或清单节点。".into())
+        self.input(id, "files")?.ok_or_else(|| "复制缺少要写入的文件，请检查上游连线。".into())
     }
 
     fn input(&mut self, id: &'a str, port: &str) -> Result<Option<List>, String> {
@@ -67,7 +80,9 @@ impl<'a> FileLists<'a> {
     fn read_edge(&mut self, edge: &'a Edge) -> Result<List, String> {
         let output = edge.source_handle.as_deref().unwrap_or("out");
         let node = self.nodes[edge.source.as_str()];
-        if output != "out" && !(node.kind == Kind::Tree && output.starts_with("item:")) {
+        let valid = output == "out" || (node.kind == Kind::Tree && output.starts_with("item:"))
+            || (node.kind == Kind::Camera && sony::Category::from_handle(output).is_some());
+        if !valid {
             return Err("无效的文件输出端口。".into());
         }
         let cache_key = (node.id.as_str(), output);
@@ -103,7 +118,7 @@ impl<'a> FileLists<'a> {
             let metadata = fs::symlink_metadata(&selected).map_err(|cause| error(&selected, cause))?;
             if metadata.is_dir() { scan(&selected, &mut files)?; }
             else if metadata.is_file() {
-                files.push((selected.clone(), metadata.len(), metadata.modified().map_err(|cause| error(&selected, cause))?));
+                files.push((selected.clone(), metadata.len(), ModificationTime(metadata.modified().map_err(|cause| error(&selected, cause))?)));
             } else { return Err("目录树端口不指向文件或文件夹。".into()); }
             self.scans.insert(selected.clone(), files);
         }
@@ -113,7 +128,7 @@ impl<'a> FileLists<'a> {
             let relative = path.strip_prefix(&base).map_err(|cause| cause.to_string())?.to_path_buf();
             Ok(Item { path: path.clone(), root: selected.clone(), output: relative.clone(), relative,
                 selection_parent: selection_parent.to_path_buf(),
-                bytes: *bytes, modified: *modified, camera: false, filtered: false })
+                bytes: *bytes, modified: *modified, camera: None, filtered: false })
         }).collect()
     }
 
@@ -127,14 +142,14 @@ impl<'a> FileLists<'a> {
         }
         if node.kind == Kind::Outputtree { return self.output_tree(node); }
         if node.kind == Kind::Merge {
-            let incoming = self.inputs.get(node.id.as_str()).ok_or("清单合并需要连接至少一个输入。")?;
+            let incoming = self.inputs.get(node.id.as_str()).ok_or("「合并文件」需要连接至少一个输入。")?;
             let mut seen: HashMap<(String, String), usize> = HashMap::new();
             let mut result: Vec<Item> = Vec::new();
             for edge in incoming {
                 for file in self.read_edge(edge)?.iter() {
                     let identity = (key(&file.path), key(&file.output));
                     if let Some(&index) = seen.get(&identity) {
-                        result[index].camera |= file.camera;
+                        result[index].camera = result[index].camera.or(file.camera);
                         result[index].filtered |= file.filtered;
                     } else {
                         seen.insert(identity, result.len());
@@ -148,7 +163,7 @@ impl<'a> FileLists<'a> {
         let list = self.input(&node.id, "files")?.ok_or("文件清单节点缺少主输入。")?;
         match node.kind {
             Kind::Subtract => {
-                let exclusions = self.input(&node.id, "exclude")?.ok_or("清单相减需要连接排除清单。")?;
+                let exclusions = self.input(&node.id, "exclude")?.ok_or("「排除文件」需要连接「排除文件」端口。")?;
                 let paths: HashSet<_> = exclusions.iter().map(|item| key(&item.path)).collect();
                 self.filter(&list, |item| !paths.contains(&key(&item.path)))
             }
@@ -171,7 +186,16 @@ impl<'a> FileLists<'a> {
                 if list.iter().any(|item| item.filtered) {
                     return Err("相机模式暂不支持清单排除，以保留素材关联。".into());
                 }
-                Ok(list.iter().cloned().map(|mut item| { item.camera = true; item }).collect())
+                let selected = sony::Category::from_handle(output);
+                if selected.is_some() {
+                    self.sony_split_sources.extend(list.iter().map(|item| item.path.clone()));
+                }
+                Ok(list.iter().zip(sony::classify(&list)?).filter_map(|(item, category)| {
+                    if selected.is_some_and(|selected| selected != category) { return None; }
+                    let mut item = item.clone();
+                    item.camera = Some(category);
+                    Some(item)
+                }).collect())
             }
             _ => Err("无效的文件清单节点。".into()),
         }
@@ -179,34 +203,34 @@ impl<'a> FileLists<'a> {
 
     fn output_tree(&mut self, node: &'a Node) -> Result<Vec<Item>, String> {
         let entries: Vec<OutputFolder> = if node.value.is_empty() { Vec::new() }
-            else { serde_json::from_str(&node.value).map_err(|_| "目录树输出配置无效。")? };
-        if entries.len() > 100 { return Err("目录树输出最多支持 100 个子目录。".into()); }
+            else { serde_json::from_str(&node.value).map_err(|_| "目标目录树配置无效。")? };
+        if entries.len() > 100 { return Err("目标目录树最多支持 100 个子目录。".into()); }
         let mut folders: HashMap<String, PathBuf> = HashMap::new();
         let mut paths = HashSet::new();
         for entry in entries {
             if entry.id.is_empty() || folders.contains_key(&entry.id) {
-                return Err("目录树输出含无效或重复的文件夹编号。".into());
+                return Err("目标目录树含无效或重复的文件夹编号。".into());
             }
             let parent = match entry.parent {
-                Some(id) => folders.get(&id).ok_or("目录树输出的上级文件夹不存在。")?.clone(),
+                Some(id) => folders.get(&id).ok_or("目标目录树的上级文件夹不存在。")?.clone(),
                 None => PathBuf::new(),
             };
             let path = parent.join(self.folder_name(&entry.name)?);
             if !paths.insert(key(&path)) {
-                return Err(format!("目录树输出含重复目录：{}", path.display()));
+                return Err(format!("目标目录树含重复目录：{}", path.display()));
             }
             folders.insert(entry.id, path);
         }
-        let incoming = self.inputs.get(node.id.as_str()).ok_or("目录树输出至少需要连接一条文件清单。")?;
+        let incoming = self.inputs.get(node.id.as_str()).ok_or("目标目录树至少需要连接一条文件清单。")?;
         let mut result = Vec::new();
         for edge in incoming {
             let handle = edge.target_handle.as_deref().unwrap_or("files");
             let disk = handle.strip_prefix("disk:").map(disk_folder).transpose()?;
             let prefix = if let Some(id) = handle.strip_prefix("folder:") {
-                Some(folders.get(id).ok_or("目录树输出连线指向不存在的文件夹。")?)
+                Some(folders.get(id).ok_or("目标目录树连线指向不存在的文件夹。")?)
             } else { disk.as_ref() };
             let files = self.read_edge(edge)?;
-            if result.len() + files.len() > 40_000 { return Err("目录树输出的清单超过 40,000 项。".into()); }
+            if result.len() + files.len() > 40_000 { return Err("目标目录树的清单超过 40,000 项。".into()); }
             result.extend(files.iter().cloned().map(|mut item| {
                 if let Some(prefix) = prefix {
                     let relative = if disk.is_some() && item.output == item.relative {
@@ -221,7 +245,7 @@ impl<'a> FileLists<'a> {
     }
 
     fn filter(&mut self, list: &[Item], keep: impl Fn(&Item) -> bool) -> Result<Vec<Item>, String> {
-        if list.iter().any(|item| item.camera) { return Err("相机模式暂不支持清单排除，以保留素材关联。".into()); }
+        if list.iter().any(|item| item.camera.is_some()) { return Err("相机模式暂不支持清单排除，以保留素材关联。".into()); }
         Ok(list.iter().filter_map(|item| {
             if keep(item) {
                 let mut item = item.clone();

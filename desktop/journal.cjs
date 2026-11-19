@@ -1,5 +1,5 @@
 const { open, mkdir, readFile, readdir, stat } = require('node:fs/promises');
-const { join } = require('node:path');
+const { isAbsolute, join } = require('node:path');
 const { randomUUID } = require('node:crypto');
 
 async function createJournal(directory, request, endpoints) {
@@ -56,8 +56,22 @@ async function identifyEndpoints(workflow) {
   const endpoints = workflow.nodes.filter(node => node.kind === 'source' || node.kind === 'target' ||
     (node.kind === 'tree' && !linkedTrees.has(node.id)));
   return Promise.all(endpoints.map(async node => {
-    const info = await stat(node.value, { bigint: true });
-    if (!info.isDirectory()) throw new Error('任务路径不是目录：' + node.value);
+    const label = node.kind === 'target' ? '目标目录' : '来源目录';
+    if (typeof node.value !== 'string' || !node.value.trim()) throw new Error(`请选择${label}。`);
+    if (!isAbsolute(node.value)) throw new Error(`请选择有效的${label}：${node.value}`);
+    let info;
+    try {
+      info = await stat(node.value, { bigint: true });
+    } catch (error) {
+      if (error.code === 'ENOENT' || error.code === 'ENOTDIR') {
+        throw new Error(`${label}不存在或设备已断开：${node.value}`);
+      }
+      if (error.code === 'EACCES' || error.code === 'EPERM') {
+        throw new Error(`没有权限访问${label}：${node.value}`);
+      }
+      throw error;
+    }
+    if (!info.isDirectory()) throw new Error(`${label}路径指向文件：${node.value}`);
     return {
       id: node.id, kind: node.kind, path: node.value,
       identity: info.dev !== 0n && info.ino !== 0n ? `${info.dev}:${info.ino}` : null,

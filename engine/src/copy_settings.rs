@@ -31,9 +31,9 @@ impl CopySettings {
         let settings = match value.trim() {
             "" => Self::default(),
             value if value.starts_with('{') => serde_json::from_str(value)
-                .map_err(|cause| format!("快速流复制参数无效：{cause}"))?,
+                .map_err(|cause| format!("流复制策略参数无效：{cause}"))?,
             value => {
-                let block_mib = value.parse::<usize>().map_err(|_| "快速流复制块大小无效。")?;
+                let block_mib = value.parse::<usize>().map_err(|_| "流复制策略的块大小无效。")?;
                 if !matches!(block_mib, 1 | 2 | 4 | 8) { return Err("旧版快速流块大小无效。".into()); }
                 Self { buffer_mib: block_mib * 3, block_mib, queue_depth: 3, small_file_kib: (block_mib * 2048) as u64,
                     mode: Mode::Parallel, ..Self::default() }

@@ -29,9 +29,13 @@ function startTransfer(executable, request, onProgress, verifyOnly = false) {
     });
     child.stdin.write(input + '\n');
   });
-  return { result, cancel: () => {
-    if (running && !child.stdin.destroyed) child.stdin.end();
-  } };
+  const command = (action) => {
+    if (!running || !child.stdin.writable) return false;
+    if (action === 'cancel') child.stdin.end();
+    else child.stdin.write(action + '\n');
+    return true;
+  };
+  return { result, cancel: () => command('cancel'), pause: () => command('pause'), resume: () => command('resume') };
 }
 
 module.exports = { startTransfer };
